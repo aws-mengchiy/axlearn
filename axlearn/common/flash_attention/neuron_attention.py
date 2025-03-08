@@ -12,22 +12,28 @@ import jax.numpy as jnp
 import jax_neuronx  # pylint: disable=unused-import
 import neuronxcc.nki.language as nl
 from jax import custom_vjp
-from neuronxcc.nki.kernels.attention import flash_attn_bwd, flash_fwd
+from axlearn.common.flash_attention.neuron_seq_packing_attention import flash_attn_bwd, flash_fwd
+from neuronxcc import nki
+from neuronxcc.nki import jit as nki_jit
+from jax_neuronx import nki_call
 
 # pytype: enable=import-error
 
 Tensor = jax.Array
 lnc = 2 if jax.devices()[0].device_kind == "NC_v3d" else 1
 
-
 # TODO(apoorvtintin): Add segment IDs as an argument when the kernel supports it.
-@partial(custom_vjp, nondiff_argnums=(5, 6, 7))
+
+@partial(custom_vjp, nondiff_argnums=(7, 8, 9))
+# @partial(custom_vjp, nondiff_argnums=(5, 6, 7))
 def flash_attention(
     query: Tensor,
     key: Tensor,
     value: Tensor,
     bias: Optional[Tensor] = None,
     prng_key: Optional[Tensor] = None,
+    q_segment_ids_tile_ref: Optional[Tensor] = None,
+    kv_segment_ids_tile_ref: Optional[Tensor] = None,
     causal: bool = False,
     softmax_scale: float = 1.0,
     dropout_rate: float = 0.0,
@@ -47,7 +53,8 @@ def flash_attention(
     Returns:
         The attention outputs of shape [batch_size, target_length, num_heads, per_head_dim].
     """
-    out, _ = _mha_forward(query, key, value, bias, prng_key, causal, softmax_scale, dropout_rate)
+    # out, _ = _mha_forward(query, key, value, bias, prng_key, causal, softmax_scale, dropout_rate)
+    out, _ = _mha_forward(query, key, value, bias, prng_key, q_segment_ids_tile_ref, kv_segment_ids_tile_ref, causal, softmax_scale, dropout_rate)
     return out
 
 
@@ -57,6 +64,10 @@ def _mha_forward(
     value: Tensor,
     bias: Tensor,
     prng_key: Tensor,
+    # segment_ids: Tensor | None,
+    # segment_ids_kv: Tensor | None,
+    q_segment_ids_tile_ref: Tensor | None,
+    kv_segment_ids_tile_ref: Tensor | None,
     causal: bool,
     softmax_scale: float,
     dropout_rate: float,
@@ -76,7 +87,7 @@ def _mha_forward(
         dropout_rate: Dropout rate to use in the kernel.
     """
     # Get the batch size, sequence lengths, number of heads, and hidden dimension.
-    batch_size, _, num_heads, _ = query.shape
+    batch_size, q_seq_len, num_heads, d_model = query.shape
 
     # Transpose the query, key, and value tensors.
     q = query.transpose(0, 2, 3, 1)  # [batch_size, num_heads, d_model, q_seq_len].
@@ -107,6 +118,7 @@ def _mha_forward(
     else:
         grid = batch_size, num_heads
 
+    # if bias is not None and q_segment_ids_tile_ref is None:
     if bias is not None:
         if bias.ndim != 4:
             raise ValueError(
@@ -122,27 +134,101 @@ def _mha_forward(
             k,
             v,
             prng_key,
-            bias,
+            q_segment_ids_tile_ref,
+            kv_segment_ids_tile_ref,
             use_causal_mask=causal,
             softmax_scale=softmax_scale,
             mixed_precision=True,
             dropout_p=dropout_rate,
+            # bias=bias,
         )
+        # attn_output, lse = flash_fwd[grid](
+        #     q,
+        #     k,
+        #     v,
+        #     prng_key,
+        #     bias,
+        #     use_causal_mask=causal,
+        #     softmax_scale=softmax_scale,
+        #     mixed_precision=True,
+        #     dropout_p=dropout_rate,
+        # )
     else:
         attn_output, lse = flash_fwd[grid](
             q,
             k,
             v,
             prng_key,
+            q_segment_ids_tile_ref,
+            kv_segment_ids_tile_ref,
             use_causal_mask=causal,
             softmax_scale=softmax_scale,
             mixed_precision=True,
             dropout_p=dropout_rate,
         )
+        # attn_output, lse = flash_fwd[grid](
+        #     q,
+        #     k,
+        #     v,
+        #     prng_key,
+        #     bias,
+        #     segment_ids,
+        #     segment_ids_kv,
+        #     softmax_scale=softmax_scale,
+        #     use_causal_mask=causal,
+        #     mixed_precision=True,
+        #     dropout_p=dropout_rate,
+        # )
+        # raise NotImplementedError(f"none bias not working")
+        # attn_output_shape = jax.ShapeDtypeStruct((batch_size, num_heads, q_seq_len, d_model), dtype=query.dtype)
+        # attn_output, lse = nki_call(
+        #     _flash_fwd_wrapper,
+        #     q,
+        #     k,
+        #     v,
+        #     prng_key,
+        #     q_segment_ids_tile_ref,
+        #     kv_segment_ids_tile_ref,
+        #     causal,
+        #     softmax_scale,
+        #     dropout_rate,
+        #     out_shape=attn_output_shape,
+        #     grid=(2,2),
+        # )
+        # attn_output, lse = _flash_fwd_wrapper(
+        #     grid=grid,
+        #     q=q,
+        #     k=k,
+        #     v=v,
+        #     prng_key=prng_key,
+        #     segment_ids=segment_ids,
+        #     segment_ids_kv=segment_ids_kv,
+        #     causal=causal,
+        #     softmax_scale=softmax_scale,
+        #     dropout_rate=dropout_rate,
+        # )
+        
+
     # Transpose the output back to the original shape.
     attn_output = attn_output.transpose(0, 2, 1, 3)  # [batch_size, q_seq_len, num_heads, d_model].
 
-    return attn_output, (lse, attn_output, q, k, v, bias, prng_key)
+    # return attn_output, (lse, attn_output, q, k, v, bias, prng_key)
+    return attn_output, (lse, attn_output, q, k, v, bias, prng_key, q_segment_ids_tile_ref, kv_segment_ids_tile_ref)
+
+def _flash_fwd_wrapper(q, k, v, prng_key, q_segment_ids_tile_ref, kv_segment_ids_tile_ref, causal, softmax_scale, dropout_rate):
+    flash_fwd(
+        q,
+        k,
+        v,
+        prng_key,
+        None,
+        q_segment_ids_tile_ref,
+        kv_segment_ids_tile_ref,
+        use_causal_mask=causal,
+        softmax_scale=softmax_scale,
+        mixed_precision=True,
+        dropout_p=dropout_rate,
+    )
 
 
 def _mha_backward(
@@ -152,7 +238,8 @@ def _mha_backward(
     res,
     d_attn_output: Tensor,
 ):
-    lse, o, q, k, v, bias, prng_key = res
+    # lse, o, q, k, v, bias, prng_key = res
+    lse, o, q, k, v, bias, prng_key, q_segment_ids_tile_ref, kv_segment_ids_tile_ref = res
     batch_size, num_heads, _, _ = q.shape
 
     # Transpose the input tensors.
@@ -184,12 +271,28 @@ def _mha_backward(
             dy,
             lse,
             prng_key,
-            bias,
+            # bias,
+            q_segment_ids_tile_ref,
+            kv_segment_ids_tile_ref,
             use_causal_mask=causal,
             mixed_precision=True,
             dropout_p=dropout_rate,
             softmax_scale=softmax_scale,
         )
+        # d_query, d_key, d_value = flash_attn_bwd[grid](
+        #     q,
+        #     k,
+        #     v,
+        #     o,
+        #     dy,
+        #     lse,
+        #     prng_key,
+        #     bias,
+        #     use_causal_mask=causal,
+        #     mixed_precision=True,
+        #     dropout_p=dropout_rate,
+        #     softmax_scale=softmax_scale,
+        # )
     else:
         d_query, d_key, d_value = flash_attn_bwd[grid](
             q,
@@ -199,18 +302,34 @@ def _mha_backward(
             dy,
             lse,
             prng_key,
+            q_segment_ids_tile_ref,
+            kv_segment_ids_tile_ref,
             use_causal_mask=causal,
             mixed_precision=True,
             dropout_p=dropout_rate,
             softmax_scale=softmax_scale,
         )
+        # d_query, d_key, d_value = flash_attn_bwd[grid](
+        #     q,
+        #     k,
+        #     v,
+        #     o,
+        #     dy,
+        #     lse,
+        #     prng_key,
+        #     use_causal_mask=causal,
+        #     mixed_precision=True,
+        #     dropout_p=dropout_rate,
+        #     softmax_scale=softmax_scale,
+        # )
 
     # Transpose the gradients back to the original shape.
     d_query = d_query.transpose(0, 3, 1, 2)  # [batch_size, q_seq_len, num_heads, d_model]
     d_key = d_key.transpose(0, 3, 1, 2)  # [batch_size, kv_seq_len, num_heads, d_model]
     d_value = d_value.transpose(0, 3, 1, 2)  # [batch_size, kv_seq_len, num_heads, d_model]
 
-    return d_query, d_key, d_value, None, None
+    # return d_query, d_key, d_value, None, None
+    return d_query, d_key, d_value, None, None, None, None
 
 
 flash_attention.defvjp(_mha_forward, _mha_backward)

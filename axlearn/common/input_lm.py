@@ -3,6 +3,7 @@
 # pylint: disable=too-many-lines
 """Input processing for language modeling."""
 
+import os
 import enum
 import functools
 from collections.abc import Sequence
@@ -18,9 +19,14 @@ from axlearn.common.config import InstantiableConfig, config_for_function, maybe
 from axlearn.common.input_text import num_bytes, tokenize, tokenize_example
 from axlearn.common.input_tf_data import rekey
 
+import jax
+
 # Value of "target_labels" which will be ignored in seq2seq processing.
 SEQ2SEQ_IGNORE_TARGET_LABEL = -1
 
+seed = os.environ.get("DATA_SEED")
+seed = int(seed) if seed is not None else None
+tf.random.set_seed(seed)
 
 class InputDataType(Enum):
     """Represents input data types for decoder-only language model training.
@@ -51,6 +57,7 @@ class PackingMethodType(Enum):
 
     EOS_DELIM_NO_MASK = "eos_delim_no_mask"
     EOS_DELIM_MASK = "eos_delim_mask"
+    NEURON_SEQ_PACK = "neuron_seq_pack"
 
 
 def text_to_lm_training_input(
@@ -134,6 +141,8 @@ def text_to_lm_training_input(
             ),
             lambda: ids[: len_ids - remainder],
         )
+        # jax.debug.print(" -1 shape means: {shape_} ", shape_= tf.reshape(new_ids, shape=(-1, max_len)).shape)
+
         return tf.reshape(new_ids, shape=(-1, max_len))
 
     def process_batched(inputs: dict[str, Any]) -> dict[str, Any]:
@@ -199,6 +208,71 @@ def text_to_lm_training_input(
 
             result["input_segment_ids"] = segment_ids
             result["input_positions"] = positions
+
+        elif packing_method == PackingMethodType.NEURON_SEQ_PACK:
+            def compute_q_kv_segment_refs(batched_input_ids, eos_id, pad_id):
+                segment_starts = tf.cast(tf.equal(batched_input_ids, eos_id), tf.int32)
+                segment_ids = tf.cumsum(segment_starts, axis=1)
+                segment_ids = segment_ids - segment_ids[:, :1] + 1
+                segment_ids = tf.where(tf.equal(batched_input_ids, pad_id), 0, segment_ids)
+
+                def compute_q_segment_ids_tile_ref(segment_ids):
+                    seq_len = segment_ids.shape[0]
+                    # Find the max value for each sequence in the batch
+                    max_segment_ids = tf.reduce_max(segment_ids, axis=None, keepdims=True)
+                    # Replace 0 with the max value for each sequence (to handle padding)
+                    segment_ids_with_max = tf.where(segment_ids == 0, max_segment_ids, segment_ids)
+                    # Initialize the result tensor with zeros, same shape as segment_ids_
+                    q_segment_ids_tile_ref = tf.zeros_like(segment_ids_with_max, dtype=tf.int32)
+                    # Iterate over each sequence (row) in the batch
+                    # for i in range(batch_size):
+                    tile_ref = 0  # Initialize the tile reference for the row
+                    tile_references = []  # To hold the tile references for this row
+                    
+                    for j in range(seq_len):
+                        # For the first element or if the segment ID changes, increment the tile reference
+                        if j == 0 or segment_ids_with_max[j] != segment_ids_with_max[j - 1]:
+                            tile_ref = j
+                        tile_references.append(tile_ref)
+                    
+                    # Convert list to tensor
+                    tile_references = tf.convert_to_tensor(tile_references, dtype=tf.int32)
+                    # Scatter update using proper indices
+                    indices = tf.range(seq_len)[:, tf.newaxis]  # Generate [[0], [1], ..., [seq_len-1]]
+                    q_segment_ids_tile_ref = tf.tensor_scatter_nd_update(q_segment_ids_tile_ref, indices, tile_references)
+
+
+                    return q_segment_ids_tile_ref
+                
+                def compute_kv_segment_ids_tile_ref(segment_ids):
+                    seq_len = segment_ids.shape[0]
+                    kv_segment_ids_tile_ref = tf.zeros_like(segment_ids, dtype=tf.int32)
+                    tile_ref = seq_len
+                    tile_references = []
+                    for j in range(seq_len-1, -1, -1):
+                        if (j != seq_len - 1) and segment_ids[j] != segment_ids[j + 1]:
+                            tile_ref = j + 1
+                        tile_references.append(tile_ref)
+                
+                    tile_references.reverse()
+
+                    # Generate indices for tensor_scatter_nd_update
+                    indices = tf.range(seq_len)[:, tf.newaxis]  # [[0], [1], ..., [seq_len-1]]
+                    kv_segment_ids_tile_ref = tf.tensor_scatter_nd_update(kv_segment_ids_tile_ref, indices, tile_references)
+
+                    return kv_segment_ids_tile_ref
+
+                q_segment_ids_tile_ref = tf.map_fn(compute_q_segment_ids_tile_ref, segment_ids)
+                kv_segment_ids_tile_ref = tf.map_fn(compute_kv_segment_ids_tile_ref,segment_ids)
+
+                return segment_ids, q_segment_ids_tile_ref, kv_segment_ids_tile_ref
+            
+            segment_ids, q_segment_ids_tile_ref, kv_segment_ids_tile_ref = compute_q_kv_segment_refs(batched_input_ids, vocab.eos_id, vocab.pad_id)
+
+            # Store in result dictionary
+            result["input_segment_ids"] = segment_ids
+            result["q_segment_ids_tile_ref"] = q_segment_ids_tile_ref
+            result["kv_segment_ids_tile_ref"] = kv_segment_ids_tile_ref
 
         return result
 

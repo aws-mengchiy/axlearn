@@ -91,6 +91,8 @@ from axlearn.common.attention_bias import (
     MaskFn,
     MaskFnAttentionBias,
     SegmentIdAttentionBias,
+    QSegmentIdsTileRefBias,
+    KVSegmentIdsTileRefBias,
     as_attention_bias,
     causal_mask,
     make_segment_mask,
@@ -148,6 +150,7 @@ from axlearn.common.utils import (
     save_and_offload_only_these_names_regex,
     shapes,
     split_prng_key,
+    with_sharding_constraint,
 )
 
 
@@ -230,6 +233,8 @@ class BaseTransformerLayer(BaseLayer):
         cross_attention_data: Optional[Tensor] = None,
         cross_attention_logit_biases: Optional[Tensor] = None,
         target_segment_ids: Optional[Tensor] = None,
+        q_segment_ids_tile_ref: Optional[Tensor] = None,
+        kv_segment_ids_tile_ref: Optional[Tensor] = None,
         target_positions: Optional[Tensor] = None,
         return_aux: Optional[set[str]] = None,
     ) -> Output:
@@ -1733,6 +1738,8 @@ class MultiheadAttention(BaseLayer):
         attention_logit_biases: Union[None, Tensor, BaseAttentionBias] = None,
         segment_ids: Optional[Tensor] = None,
         query_positions: Optional[Tensor] = None,
+        q_segment_ids_tile_ref: Optional[Tensor] = None,
+        kv_segment_ids_tile_ref: Optional[Tensor] = None,
         cached_states: Optional[NestedTensor] = None,
         return_aux: Optional[set[str]] = None,
     ) -> tuple[Nested[Tensor], Optional[Output]]:
@@ -1832,6 +1839,20 @@ class MultiheadAttention(BaseLayer):
                 )
         if segment_ids is not None:
             attention_logit_biases += SegmentIdAttentionBias(segment_ids)
+        
+        # jax.debug.print("q_segment_ids_tile_ref: {q_segment_ids_tile_ref}", q_segment_ids_tile_ref=q_segment_ids_tile_ref)
+        # jax.debug.print("kv_segment_ids_tile_ref: {kv_segment_ids_tile_ref}", kv_segment_ids_tile_ref=kv_segment_ids_tile_ref)
+        # jax.debug.print("q_segment_ids_tile_ref shape: {q_segment_ids_tile_ref}", q_segment_ids_tile_ref=q_segment_ids_tile_ref.shape)
+        # jax.debug.print("kv_segment_ids_tile_ref shape: {kv_segment_ids_tile_ref}", kv_segment_ids_tile_ref=kv_segment_ids_tile_ref.shape)
+        # if q_segment_ids_tile_ref is not None:
+        #     jax.debug.print("12345abcde")
+
+        if q_segment_ids_tile_ref is not None:
+            attention_logit_biases += QSegmentIdsTileRefBias(q_segment_ids_tile_ref)
+
+        if kv_segment_ids_tile_ref is not None:
+            attention_logit_biases += KVSegmentIdsTileRefBias(kv_segment_ids_tile_ref)
+
         context, probs = self._compute_attention(
             mode=mode,
             q_proj=q_proj,
@@ -1897,6 +1918,8 @@ class MultiheadAttention(BaseLayer):
         attention_logit_biases: Optional[Tensor] = None,
         segment_ids: Optional[Tensor] = None,
         query_positions: Optional[Tensor] = None,
+        q_segment_ids_tile_ref: Optional[Tensor] = None,
+        kv_segment_ids_tile_ref: Optional[Tensor] = None,
         return_aux: Optional[set[str]] = None,
     ) -> Output:
         """Computes attention for the given query, key, value, and attention logit biases.
@@ -1920,6 +1943,9 @@ class MultiheadAttention(BaseLayer):
         Raises:
             ValueError: If key & value are an invalid combination.
         """
+        # jax.debug.print("q_segment_ids_tile_ref inside MHA forward: {q_segment_ids_tile_ref}", q_segment_ids_tile_ref=q_segment_ids_tile_ref)
+        # jax.deug.print("segment_ids: {segment_ids}", segment_ids=segment_ids)
+
         _, output = self._forward_for_mode(
             mode=ForwardMode.FORWARD,
             query=query,
@@ -1929,8 +1955,11 @@ class MultiheadAttention(BaseLayer):
             attention_logit_biases=attention_logit_biases,
             segment_ids=segment_ids,
             query_positions=query_positions,
+            q_segment_ids_tile_ref=q_segment_ids_tile_ref,
+            kv_segment_ids_tile_ref=kv_segment_ids_tile_ref,
             return_aux=return_aux,
         )
+        output = with_sharding_constraint(output, PartitionSpec('fsdp', None, None))
         return output
 
     def _cap_logits(self, logits: Tensor) -> Tensor:
@@ -2525,6 +2554,8 @@ class TransformerAttentionLayer(BaseLayer):
         attention_logit_biases: Optional[Tensor] = None,
         segment_ids: Optional[Tensor] = None,
         target_positions: Optional[Tensor] = None,
+        q_segment_ids_tile_ref: Optional[Tensor] = None,
+        kv_segment_ids_tile_ref: Optional[Tensor] = None,
         cached_states: Optional[NestedTensor] = None,
         return_aux: Optional[set[str]] = None,
     ) -> tuple[Optional[Nested[Tensor]], Optional[Output]]:
@@ -2575,6 +2606,8 @@ class TransformerAttentionLayer(BaseLayer):
                         attention_logit_biases=attention_logit_biases,
                         segment_ids=segment_ids,
                         query_positions=target_positions,
+                        q_segment_ids_tile_ref=q_segment_ids_tile_ref,
+                        kv_segment_ids_tile_ref=kv_segment_ids_tile_ref,
                     ),
                 )
             elif mode == ForwardMode.INIT_STATES:
@@ -2638,6 +2671,8 @@ class TransformerAttentionLayer(BaseLayer):
         attention_logit_biases: Optional[Tensor] = None,
         segment_ids: Optional[Tensor] = None,
         target_positions: Optional[Tensor] = None,
+        q_segment_ids_tile_ref: Optional[Tensor] = None,
+        kv_segment_ids_tile_ref: Optional[Tensor] = None,
         return_aux: Optional[set[str]] = None,
     ) -> Output:
         """Computes attention with target as query and source as key and value.
@@ -2665,6 +2700,8 @@ class TransformerAttentionLayer(BaseLayer):
             attention_logit_biases=attention_logit_biases,
             segment_ids=segment_ids,
             target_positions=target_positions,
+            q_segment_ids_tile_ref=q_segment_ids_tile_ref,
+            kv_segment_ids_tile_ref=kv_segment_ids_tile_ref,
             cached_states=None,
             return_aux=return_aux,
         )
@@ -3048,6 +3085,8 @@ class TransformerLayer(BaseTransformerLayer):
         cross_attention_logit_biases: Optional[Tensor] = None,
         target_segment_ids: Optional[Tensor] = None,
         target_positions: Optional[Tensor] = None,
+        q_segment_ids_tile_ref: Optional[Tensor] = None,
+        kv_segment_ids_tile_ref: Optional[Tensor] = None,
         cached_states: Optional[NestedTensor] = None,
         return_aux: Optional[set[str]] = None,
     ) -> tuple[Optional[NestedTensor], Optional[BaseTransformerLayer.Output]]:
@@ -3096,6 +3135,8 @@ class TransformerLayer(BaseTransformerLayer):
                     target=data,
                     segment_ids=target_segment_ids,
                     target_positions=target_positions,
+                    q_segment_ids_tile_ref=q_segment_ids_tile_ref,
+                    kv_segment_ids_tile_ref=kv_segment_ids_tile_ref,
                     source=self_attention_kv_state,
                     attention_logit_biases=self_attention_logit_biases,
                     return_aux=self_attention_return_aux,

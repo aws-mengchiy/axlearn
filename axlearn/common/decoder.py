@@ -500,6 +500,10 @@ class Decoder(BaseLayer):
         validate_contains_paths(input_batch, paths=["input_ids"])
         input_segment_ids = input_batch.get("input_segment_ids", None)
         positions = input_batch.get("positions", None)
+        q_segment_ids_tile_ref = input_batch.get("q_segment_ids_tile_ref", None)
+        kv_segment_ids_tile_ref = input_batch.get("kv_segment_ids_tile_ref", None)
+
+        # jax.debug.print("q_segment_ids_tile_ref inside decoder _forward_for_mode: {q_segment_ids_tile_ref}", q_segment_ids_tile_ref=q_segment_ids_tile_ref)
 
         emb_batch = {**input_batch}
         emb_batch["inputs"] = emb_batch["input_ids"]
@@ -513,6 +517,8 @@ class Decoder(BaseLayer):
                     self_attention_logit_biases=self_attention_logit_biases,
                     target_segment_ids=input_segment_ids,
                     target_positions=positions,
+                    q_segment_ids_tile_ref=q_segment_ids_tile_ref,
+                    kv_segment_ids_tile_ref=kv_segment_ids_tile_ref,
                     cross_attention_data=cross_attention_data,
                     cross_attention_logit_biases=cross_attention_logit_biases,
                 ),

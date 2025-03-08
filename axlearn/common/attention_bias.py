@@ -391,6 +391,48 @@ def _spec_for_explicit_bias(
 
 
 @struct.dataclass
+class QSegmentIdsTileRefBias(BaseAttentionBias):
+    q_segment_ids_tile_ref: Tensor
+
+    @final
+    def _value(self) -> Optional[Tensor]:
+        bias_value = self.q_segment_ids_tile_ref
+        if bias_value is None:
+            return None
+        else:
+            return bias_value
+    
+    def partition_spec(
+        self, mha_dim_to_partition_spec: dict[str, PartitionSpec]
+    ) -> Union[BaseAttentionBias, PartitionSpec]:
+        # Segment IDs: [batch_size, seq_len].
+        q_spec = mha_dim_to_partition_spec["btnh"]
+        if q_spec == PartitionSpec(None):
+            return PartitionSpec(None)
+        return PartitionSpec(q_spec[0], q_spec[1])
+
+@struct.dataclass
+class KVSegmentIdsTileRefBias(BaseAttentionBias):
+    kv_segment_ids_tile_ref: Tensor
+
+    @final
+    def _value(self) -> Optional[Tensor]:
+        bias_value = self.kv_segment_ids_tile_ref
+        if bias_value is None:
+            return None
+        else:
+            return bias_value
+
+    def partition_spec(
+        self, mha_dim_to_partition_spec: dict[str, PartitionSpec]
+    ) -> Union[BaseAttentionBias, PartitionSpec]:
+        # Segment IDs: [batch_size, seq_len].
+        q_spec = mha_dim_to_partition_spec["btnh"]
+        if q_spec == PartitionSpec(None):
+            return PartitionSpec(None)
+        return PartitionSpec(q_spec[0], q_spec[1])
+
+@struct.dataclass
 class BoolAttentionBias(BaseAttentionBias):
     """An attention bias represented as a boolean mask."""
 

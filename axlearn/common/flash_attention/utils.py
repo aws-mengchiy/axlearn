@@ -17,6 +17,8 @@ from axlearn.common.attention_bias import (
     MaskFnAttentionBias,
     SegmentIdAttentionBias,
     TensorAttentionBias,
+    QSegmentIdsTileRefBias,
+    KVSegmentIdsTileRefBias,
     split,
 )
 from axlearn.common.flash_attention.gpu_attention import cudnn_dot_product_attention
@@ -178,6 +180,40 @@ def flash_attention_implementation(
                     f"{segment_ids.eval_shape()} vs. {query.shape[0]}"
                 )
             return segment_ids.segment_ids
+        
+        def get_q_segment_ids_tile_ref(q_segment_ids_tile_ref: QSegmentIdsTileRefBias) -> Optional[Tensor]:
+            """Return the segment ids Tensor from the sequence of segment ids attention
+            biases or None if there are no segment ids.
+            """
+            if not q_segment_ids_tile_ref.has_value():
+                return None
+            if query.shape[1] != key.shape[1]:
+                raise ValueError(
+                    "segment_ids is only supported for query and key with identical lengths."
+                )
+            if q_segment_ids_tile_ref.eval_shape()[0] != query.shape[0]:
+                raise ValueError(
+                    "segment_ids must have matching batch dim: "
+                    f"{q_segment_ids_tile_ref.eval_shape()} vs. {query.shape[0]}"
+                )
+            return q_segment_ids_tile_ref.q_segment_ids_tile_ref
+        
+        def get_kv_segment_ids_tile_ref(kv_segment_ids_tile_ref: KVSegmentIdsTileRefBias) -> Optional[Tensor]:
+            """Return the segment ids Tensor from the sequence of segment ids attention
+            biases or None if there are no segment ids.
+            """
+            if not kv_segment_ids_tile_ref.has_value():
+                return None
+            if query.shape[1] != key.shape[1]:
+                raise ValueError(
+                    "segment_ids is only supported for query and key with identical lengths."
+                )
+            if kv_segment_ids_tile_ref.eval_shape()[0] != query.shape[0]:
+                raise ValueError(
+                    "segment_ids must have matching batch dim: "
+                    f"{kv_segment_ids_tile_ref.eval_shape()} vs. {query.shape[0]}"
+                )
+            return kv_segment_ids_tile_ref.kv_segment_ids_tile_ref
 
         if backend == "gpu":
             # TODO(hanzhi-zhou): supports small q sequence length for future use cases such as
@@ -294,8 +330,9 @@ def flash_attention_implementation(
             key = _repeat_kv_heads(query.shape[2], key)
             value = _repeat_kv_heads(query.shape[2], value)
 
-            # other_biases includes SegmentIdAttentionBias among other biases.
-            causal, other_biases = split(bias, CausalAttentionBias)
+            # other_biases includes SegmentIdAttentionBias among other biases. #FIXME: change comment later on.
+            causal, segment_ids, q_segment_ids_tile_ref, kv_segment_ids_tile_ref, other_biases = split(bias, CausalAttentionBias, SegmentIdAttentionBias, QSegmentIdsTileRefBias, KVSegmentIdsTileRefBias)
+            # causal, other_biases = split(bias, CausalAttentionBias)
 
             # TODO(apoorvtintin): Remove this once dropout support in kernel is ready.
             if dropout_rate > 0:
@@ -306,6 +343,9 @@ def flash_attention_implementation(
                 key,
                 value,
                 bias=other_biases.value(),
+                # segment_ids=get_segment_ids(segment_ids),
+                q_segment_ids_tile_ref=get_q_segment_ids_tile_ref(q_segment_ids_tile_ref),
+                kv_segment_ids_tile_ref=get_kv_segment_ids_tile_ref(kv_segment_ids_tile_ref),
                 causal=causal.has_value(),
                 softmax_scale=softmax_scale,
                 dropout_rate=dropout_rate,

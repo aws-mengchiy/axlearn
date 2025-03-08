@@ -60,7 +60,7 @@ from axlearn.common.utils import (
     thread_stack_traces,
 )
 
-
+from jax_neuronx.experimental.debug_utils import debug_callback
 class TrainerState(NamedTuple):
     prng_key: Union[Tensor, TensorSpec, jax.sharding.NamedSharding]
     model: Union[NestedTensor, Nested[TensorSpec], Nested[jax.sharding.NamedSharding]]
@@ -565,6 +565,11 @@ class SpmdTrainer(Module):
                 num_steps = 0
                 output = None
                 stop_trace_step = None
+
+                # skip previous batches
+                for i in range(self.step):
+                    self.vlog(3, f"skipping batch for step {i}")
+                    next(self.input.batches(self._input_iter))
 
                 for input_batch in self.input.batches(self._input_iter):
                     self._maybe_record_event(measurement.Event.START_STEP, self._step)
@@ -1086,7 +1091,7 @@ class SpmdTrainer(Module):
         return evaler_summaries
 
     def _pjit_train_step(self) -> jax.stages.Wrapped:
-        return pjit(
+        return debug_callback(pjit(
             self._train_step,
             in_shardings=(
                 self._trainer_state_partition_specs,
@@ -1100,7 +1105,9 @@ class SpmdTrainer(Module):
                     aux=None,
                 ),
             ),
-            donate_argnums=(0,),  # donate the state
+            donate_argnums=(0,),),
+            # Only required if you're printing within while loops. Might run into lowering issues without this.
+            # while_loop_tripcount = xyz,
         )
 
     def compile_train_step(
