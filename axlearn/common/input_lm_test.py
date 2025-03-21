@@ -251,6 +251,110 @@ class LmTrainingInputTest(BaseLmInputTest):
             ],
             max_padding_fraction=0.0,  # Do not pad
         ),
+        dict(
+            packing_method=PackingMethodType.NEURON_SEQ_PACK,
+            expected_batches=[
+                {
+                    "input_ids": [
+                        [1, 21820, 296, 2, 29],
+                        [3155, 1, 21820, 8114, 2],
+                    ],
+                    "target_labels": [
+                        [21820, 296, 2, 29, 3155],
+                        [1, 21820, 8114, 2, 29],
+                    ],
+                    "input_segment_ids": [
+                        [1, 1, 1, 1, 1],
+                        [1, 2, 2, 2, 2],
+                    ],
+                    "q_segment_ids_tile_ref": [
+                        [0, 0, 0, 0, 0],
+                        [0, 1, 1, 1, 1],
+                    ],
+                    "kv_segment_ids_tile_ref": [
+                        [5, 5, 5, 5, 5],
+                        [1, 5, 5, 5, 5],
+                    ],
+                    "target_num_bytes": [18, 17],
+                },
+                {
+                    "input_ids": [
+                        [29, 3155, 1, 21820, 296],
+                        [1, 21820, 8114, 2, 29],
+                    ],
+                    "target_labels": [
+                        [3155, 1, 21820, 296, 2],
+                        [21820, 8114, 2, 29, 3155],
+                    ],
+                    "input_segment_ids": [
+                        [1, 1, 2, 2, 2],
+                        [1, 1, 1, 1, 1],
+                    ],
+                    "q_segment_ids_tile_ref": [
+                        [0, 0, 2, 2, 2],
+                        [0, 0, 0, 0, 0],
+                    ],
+                    "kv_segment_ids_tile_ref": [
+                        [2, 2, 5, 5, 5],
+                        [5, 5, 5, 5, 5],
+                    ],
+                    "target_num_bytes": [19, 17],
+                },
+            ],
+            max_padding_fraction=0.0,  # Do not pad
+        ),
+        dict(
+            packing_method=PackingMethodType.NEURON_SEQ_PACK,
+            expected_batches=[
+                {
+                    "input_ids": [
+                        [1, 21820, 296, 2, 29],
+                        [3155, 1, 21820, 8114, 2],
+                    ],
+                    "target_labels": [
+                        [21820, 296, 2, 29, 3155],
+                        [1, 21820, 8114, 2, 29],
+                    ],
+                    "input_segment_ids": [
+                        [1, 1, 1, 1, 1],
+                        [1, 2, 2, 2, 2],
+                    ],
+                    "q_segment_ids_tile_ref": [
+                        [0, 0, 0, 0, 0],
+                        [0, 1, 1, 1, 1],
+                    ],
+                    "kv_segment_ids_tile_ref": [
+                        [5, 5, 5, 5, 5],
+                        [1, 5, 5, 5, 5],
+                    ],
+                    "target_num_bytes": [18, 17],
+                },
+                {
+                    "input_ids": [
+                        [29, 3155, 1, 21820, 296],
+                        [2, 29, 3155, 0, 0],
+                    ],
+                    "target_labels": [
+                        [3155, 1, 21820, 296, 2],
+                        [29, 3155, 1, 0, 0],
+                    ],
+                    "input_segment_ids": [
+                        [1, 1, 2, 2, 2],
+                        [1, 1, 1, 0, 0],
+                    ],
+                    "q_segment_ids_tile_ref": [
+                        [0, 0, 2, 2, 2],
+                        [0, 0, 0, 0, 0],
+                    ],
+                    "kv_segment_ids_tile_ref": [
+                        [2, 2, 5, 5, 5],
+                        [3, 3, 3, 5, 5],
+                    ],
+                    "target_num_bytes": [19, 3],
+                },
+            ],
+            max_padding_fraction=1.0,  # Always pad
+        ),
     )
     @pytest.mark.skipif(
         not os.path.exists(t5_sentence_piece_vocab_file), reason="Missing testdata."
