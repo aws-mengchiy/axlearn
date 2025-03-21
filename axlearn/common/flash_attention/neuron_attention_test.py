@@ -64,7 +64,7 @@ def get_segment_ids(batch_size, length, n_seq):
         rhs_batch.append(rhs)
         segment_ids_batch.append(segment_ids)
     
-    return seq_lens, np.array(lhs_batch), np.array(rhs_batch), np.array(segment_ids_batch)
+    return seq_lens, np.array(lhs_batch), np.array(rhs_batch), np.array(segment_ids_batch)+1
 
 @pytest.mark.parametrize(
     "batch_size,seq_len,num_heads,per_head_dim",
