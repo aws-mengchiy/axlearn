@@ -391,14 +391,22 @@ def load_v_tile(v_hbm_tile, cur_v_tile, j, v_i, config):
 
 
 
+# @nki.jit
+# def flash_fwd(q, k, v, seed, logit_bias=None,
+#               q_segment_ids_tile_ref=None, 
+#               kv_segment_ids_tile_ref=None,
+#               softmax_scale=None,
+#               use_causal_mask=True,
+#               mixed_precision=True,
+#               dropout_p=0.0, config=None):
 @nki.jit
-def flash_fwd(q, k, v, seed, logit_bias=None,
+def flash_fwd(q, k, v, seed,
               q_segment_ids_tile_ref=None, 
               kv_segment_ids_tile_ref=None,
               softmax_scale=None,
               use_causal_mask=True,
               mixed_precision=True,
-              dropout_p=0.0, config=None):
+              dropout_p=0.0, logit_bias=None, config=None):
   """
   Flash Attention Forward kernel
 
@@ -619,19 +627,33 @@ def flash_fwd(q, k, v, seed, logit_bias=None,
 
 
 
+# @nki.jit
+# def flash_attn_bwd(
+#   q_ref, k_ref, v_ref, o_ref,
+#   dy_ref,
+#   lse_ref,
+#   seed_ref,
+#   logit_bias_ref=None,
+#   q_segment_ids_tile_ref=None, 
+#   kv_segment_ids_tile_ref=None,
+#   use_causal_mask=False,
+#   mixed_precision=False,
+#   dropout_p=0.0,
+#   softmax_scale=None,
+# ):
 @nki.jit
 def flash_attn_bwd(
   q_ref, k_ref, v_ref, o_ref,
   dy_ref,
   lse_ref,
   seed_ref,
-  logit_bias_ref=None,
   q_segment_ids_tile_ref=None, 
   kv_segment_ids_tile_ref=None,
   use_causal_mask=False,
   mixed_precision=False,
   dropout_p=0.0,
   softmax_scale=None,
+  logit_bias_ref=None,
 ):
   """
   Flash attention backward kernel. Compute the backward gradients.
