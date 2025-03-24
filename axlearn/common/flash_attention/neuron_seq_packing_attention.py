@@ -8,6 +8,7 @@ import numpy as np
 
 import neuronxcc.nki.isa as nisa
 import neuronxcc.nki.language as nl
+from neuronxcc.nki._private.private_api import inline_asm_bytes
 from neuronxcc import nki
 
 from neuronxcc.nki.language import par_dim
@@ -78,6 +79,33 @@ def dropout_p_local(p_local, dropout_p, dropout_p_tensor, seed_tensor,
                                  rate=dropout_p_tensor[:, 0])
     p_local[:, p_local_f_slice] = nl.multiply(
       softmax_dropout, 1 / (1 - dropout_p))
+
+
+def nki_asm_get_sequence_bounds(input_tensor, output_tensor_dtype):
+
+    input_tensor_shape  = input_tensor.shape
+    output_tensor_shape = (input_tensor_shape[0], input_tensor_shape[1], 2*input_tensor_shape[2])
+    print(f"input shape {input_tensor_shape}")
+    bound_output = nl.ndarray(output_tensor_shape, dtype=output_tensor_dtype, buffer=nl.hbm)
+
+    input_sequence = nl.load(input_tensor)
+    tmp = nl.ndarray(output_tensor_shape, dtype=output_tensor_dtype)
+
+    # INT32 = 0x8
+    # FP32 = 0xa
+    input_tpb_dtype = '8' if input_tensor.dtype==np.int32 else 'a'
+    output_tpb_dtype = '8' if output_tensor_dtype==np.int32 else 'a'
+
+    inline_bytes = (
+            f"f0_10_00_00_{{events:NEURON_ISA_TBP_EVENTS:DATAPATH}}_05_05_0{input_tpb_dtype}_0{output_tpb_dtype}_"
+            "{srcs[0]:NEURON_ISA_TPB_TENSOR3D}_{dsts[0]:NEURON_ISA_TPB_TENSOR3D}_"
+            "00_00_00_00_00_00_00_00_00_00_00_00_00_00_00_00"
+            )
+
+    inline_asm_bytes(dsts=[tmp], srcs=[input_sequence], engine=nisa.gpsimd_engine, asm_bytes=inline_bytes)
+
+    nl.store(bound_output, value=tmp)
+    return bound_output
 
 
 @nki.jit(mode='trace')
@@ -362,23 +390,15 @@ def load_v_tile(v_hbm_tile, cur_v_tile, j, v_i, config):
     dtype=cur_v_tile.dtype)
 
 
-# @nki.jit
-# def flash_fwd(q, k, v, seed, logit_bias=None,
-#               q_segment_ids_tile_ref=None, 
-#               kv_segment_ids_tile_ref=None,
-#               softmax_scale=None,
-#               use_causal_mask=True,
-#               mixed_precision=True,
-#               dropout_p=0.0, config=None):
 
 @nki.jit
-def flash_fwd(q, k, v, seed,
+def flash_fwd(q, k, v, seed, logit_bias=None,
               q_segment_ids_tile_ref=None, 
               kv_segment_ids_tile_ref=None,
               softmax_scale=None,
               use_causal_mask=True,
               mixed_precision=True,
-              dropout_p=0.0, logit_bias=None, config=None):
+              dropout_p=0.0, config=None):
   """
   Flash Attention Forward kernel
 
@@ -599,34 +619,19 @@ def flash_fwd(q, k, v, seed,
 
 
 
-# @nki.jit
-# def flash_attn_bwd(
-#   q_ref, k_ref, v_ref, o_ref,
-#   dy_ref,
-#   lse_ref,
-#   seed_ref,
-#   logit_bias_ref=None,
-#   q_segment_ids_tile_ref=None, 
-#   kv_segment_ids_tile_ref=None,
-#   use_causal_mask=False,
-#   mixed_precision=False,
-#   dropout_p=0.0,
-#   softmax_scale=None,
-# ):
-
 @nki.jit
 def flash_attn_bwd(
   q_ref, k_ref, v_ref, o_ref,
   dy_ref,
   lse_ref,
   seed_ref,
+  logit_bias_ref=None,
   q_segment_ids_tile_ref=None, 
   kv_segment_ids_tile_ref=None,
   use_causal_mask=False,
   mixed_precision=False,
   dropout_p=0.0,
   softmax_scale=None,
-  logit_bias_ref=None,
 ):
   """
   Flash attention backward kernel. Compute the backward gradients.

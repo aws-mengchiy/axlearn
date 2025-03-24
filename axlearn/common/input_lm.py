@@ -250,6 +250,8 @@ def text_to_lm_training_input(
                     tile_ref = seq_len
                     tile_references = []
                     for j in range(seq_len-1, -1, -1):
+                        if segment_ids[j] == 0:
+                            tile_ref = -1
                         if (j != seq_len - 1) and segment_ids[j] != segment_ids[j + 1]:
                             tile_ref = j + 1
                         tile_references.append(tile_ref)

@@ -348,7 +348,7 @@ class LmTrainingInputTest(BaseLmInputTest):
                     ],
                     "kv_segment_ids_tile_ref": [
                         [2, 2, 5, 5, 5],
-                        [3, 3, 3, 5, 5],
+                        [3, 3, 3, -1, -1],
                     ],
                     "target_num_bytes": [19, 3],
                 },
