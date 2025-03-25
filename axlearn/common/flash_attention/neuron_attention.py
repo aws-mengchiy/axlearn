@@ -12,7 +12,7 @@ import jax.numpy as jnp
 import jax_neuronx  # pylint: disable=unused-import
 import neuronxcc.nki.language as nl
 from jax import custom_vjp
-from axlearn.common.flash_attention.neuron_seq_packing_attention import flash_attn_bwd, flash_fwd
+from axlearn.common.flash_attention.neuron_seq_packing_attention import flash_attn_bwd, flash_attn_bwd_no_bias, flash_fwd, flash_fwd_no_bias
 from neuronxcc import nki
 from neuronxcc.nki import jit as nki_jit
 from jax_neuronx import nki_call
@@ -134,27 +134,16 @@ def _mha_forward(
             k,
             v,
             prng_key,
+            bias,
             q_segment_ids_tile_ref,
             kv_segment_ids_tile_ref,
             use_causal_mask=causal,
             softmax_scale=softmax_scale,
             mixed_precision=True,
             dropout_p=dropout_rate,
-            # bias=bias,
         )
-        # attn_output, lse = flash_fwd[grid](
-        #     q,
-        #     k,
-        #     v,
-        #     prng_key,
-        #     bias,
-        #     use_causal_mask=causal,
-        #     softmax_scale=softmax_scale,
-        #     mixed_precision=True,
-        #     dropout_p=dropout_rate,
-        # )
     else:
-        attn_output, lse = flash_fwd[grid](
+        attn_output, lse = flash_fwd_no_bias[grid](
             q,
             k,
             v,
@@ -166,47 +155,6 @@ def _mha_forward(
             mixed_precision=True,
             dropout_p=dropout_rate,
         )
-        # attn_output, lse = flash_fwd[grid](
-        #     q,
-        #     k,
-        #     v,
-        #     prng_key,
-        #     bias,
-        #     segment_ids,
-        #     segment_ids_kv,
-        #     softmax_scale=softmax_scale,
-        #     use_causal_mask=causal,
-        #     mixed_precision=True,
-        #     dropout_p=dropout_rate,
-        # )
-        # raise NotImplementedError(f"none bias not working")
-        # attn_output_shape = jax.ShapeDtypeStruct((batch_size, num_heads, q_seq_len, d_model), dtype=query.dtype)
-        # attn_output, lse = nki_call(
-        #     _flash_fwd_wrapper,
-        #     q,
-        #     k,
-        #     v,
-        #     prng_key,
-        #     q_segment_ids_tile_ref,
-        #     kv_segment_ids_tile_ref,
-        #     causal,
-        #     softmax_scale,
-        #     dropout_rate,
-        #     out_shape=attn_output_shape,
-        #     grid=(2,2),
-        # )
-        # attn_output, lse = _flash_fwd_wrapper(
-        #     grid=grid,
-        #     q=q,
-        #     k=k,
-        #     v=v,
-        #     prng_key=prng_key,
-        #     segment_ids=segment_ids,
-        #     segment_ids_kv=segment_ids_kv,
-        #     causal=causal,
-        #     softmax_scale=softmax_scale,
-        #     dropout_rate=dropout_rate,
-        # )
         
 
     # Transpose the output back to the original shape.
@@ -215,8 +163,8 @@ def _mha_forward(
     # return attn_output, (lse, attn_output, q, k, v, bias, prng_key)
     return attn_output, (lse, attn_output, q, k, v, bias, prng_key, q_segment_ids_tile_ref, kv_segment_ids_tile_ref)
 
-def _flash_fwd_wrapper(q, k, v, prng_key, q_segment_ids_tile_ref, kv_segment_ids_tile_ref, causal, softmax_scale, dropout_rate):
-    flash_fwd(
+def _flash_fwd_wrapper(grid, q, k, v, prng_key, q_segment_ids_tile_ref, kv_segment_ids_tile_ref, causal, softmax_scale, dropout_rate):
+    flash_fwd[grid](
         q,
         k,
         v,
@@ -271,7 +219,7 @@ def _mha_backward(
             dy,
             lse,
             prng_key,
-            # bias,
+            bias,
             q_segment_ids_tile_ref,
             kv_segment_ids_tile_ref,
             use_causal_mask=causal,
@@ -279,22 +227,8 @@ def _mha_backward(
             dropout_p=dropout_rate,
             softmax_scale=softmax_scale,
         )
-        # d_query, d_key, d_value = flash_attn_bwd[grid](
-        #     q,
-        #     k,
-        #     v,
-        #     o,
-        #     dy,
-        #     lse,
-        #     prng_key,
-        #     bias,
-        #     use_causal_mask=causal,
-        #     mixed_precision=True,
-        #     dropout_p=dropout_rate,
-        #     softmax_scale=softmax_scale,
-        # )
     else:
-        d_query, d_key, d_value = flash_attn_bwd[grid](
+        d_query, d_key, d_value = flash_attn_bwd_no_bias[grid](
             q,
             k,
             v,
@@ -309,19 +243,6 @@ def _mha_backward(
             dropout_p=dropout_rate,
             softmax_scale=softmax_scale,
         )
-        # d_query, d_key, d_value = flash_attn_bwd[grid](
-        #     q,
-        #     k,
-        #     v,
-        #     o,
-        #     dy,
-        #     lse,
-        #     prng_key,
-        #     use_causal_mask=causal,
-        #     mixed_precision=True,
-        #     dropout_p=dropout_rate,
-        #     softmax_scale=softmax_scale,
-        # )
 
     # Transpose the gradients back to the original shape.
     d_query = d_query.transpose(0, 3, 1, 2)  # [batch_size, q_seq_len, num_heads, d_model]

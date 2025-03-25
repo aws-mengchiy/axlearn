@@ -390,23 +390,14 @@ def load_v_tile(v_hbm_tile, cur_v_tile, j, v_i, config):
     dtype=cur_v_tile.dtype)
 
 
-
-# @nki.jit
-# def flash_fwd(q, k, v, seed, logit_bias=None,
-#               q_segment_ids_tile_ref=None, 
-#               kv_segment_ids_tile_ref=None,
-#               softmax_scale=None,
-#               use_causal_mask=True,
-#               mixed_precision=True,
-#               dropout_p=0.0, config=None):
 @nki.jit
-def flash_fwd(q, k, v, seed,
+def flash_fwd(q, k, v, seed, logit_bias,
               q_segment_ids_tile_ref=None, 
               kv_segment_ids_tile_ref=None,
               softmax_scale=None,
               use_causal_mask=True,
               mixed_precision=True,
-              dropout_p=0.0, logit_bias=None, config=None):
+              dropout_p=0.0, config=None):
   """
   Flash Attention Forward kernel
 
@@ -625,24 +616,477 @@ def flash_fwd(q, k, v, seed,
 
   return o
 
+@nki.jit
+def flash_fwd_no_bias(q, k, v, seed,
+              q_segment_ids_tile_ref=None, 
+              kv_segment_ids_tile_ref=None,
+              softmax_scale=None,
+              use_causal_mask=True,
+              mixed_precision=True,
+              dropout_p=0.0, config=None):
+  """
+  Flash Attention Forward kernel
+
+  IO tensor layouts:
+    - q: shape   (bs, n_heads, d, seq_q)
+    - k: shape   (bs, nk_heads, d, seq_k)
+    - v: shape   (bs, nv_heads, d, seq_v) if config.should_transpose_v  else (bs, nv_heads, seq_v, d)
+    - seed: shape (1,)
+    - logit_bias: shape (bs, n_heads, seq_q, seq_k)
+    - q_segment_ids_tile_ref: (bs, seq_q)
+    - kv_segment_ids_tile_ref: (bs, seq_k)
+    - o: shape (bs, n_heads, seq_q, d)
+    - lse: shape (bs, n_heads, nl.tile_size.pmax, seq // nl.tile_size.pmax) if training else None
+    - This kernel requires seq_k == seq_v
+
+  IO tensor dtypes:
+    - This kernel assumes all IO tensors have the same dtype
+    - If mixed_precision is True, then all Tensor Engine operation will be performed in
+      bfloat16 and accumulation will be performed in float32. Otherwise the intermediates
+      will be in the same type as the inputs.
+
+  Compile-time Constants:
+    - softmax_scale: scaling for softmax, is None, default is `1.0/(d**0.5)`
+    - mixed_precision: flag to set non-matmul ops in fp32 precision, default is set to `true`, if false, we use same precision as input types
+    - causal_mask: flag to set causal masking
+    - config: Instance of :class:`nki.kernels.attention.FlashConfig` with Performance config parameters for flash attention with default values
+        seq_tile_size: `default=2048`, size of the kv tile size for attention computation reduction
+        training: bool to indicate training vs inference `default=True`
+
+  Performance Notes:
+    For better performance, the kernel is tiled to be of size `config.seq_tile_size`, and Flash attention math techniques are applied in unit
+    of `config.seq_tile_size`. Seqlen that is not divisible by `config.seq_tile_size` is not supported at the moment.
+
+    For large seqlen, `o_buffer` will overflow the statebuf. the kernel is tile `o_buffer` based on the value of `config.attn_core_tile_size`.
+    This is a tradeoff between memory usage and performance. The default value of `config.attn_core_tile_size` is 256, which means the `o_buffer`
+    will roughly take half of the statebuf. The computes are also tiled accordingly. DMA will be rematerialized
+    `seqlen_q // B_P_SIZE // attn_core_tile_size times`.
 
 
-# @nki.jit
-# def flash_attn_bwd(
-#   q_ref, k_ref, v_ref, o_ref,
-#   dy_ref,
-#   lse_ref,
-#   seed_ref,
-#   logit_bias_ref=None,
-#   q_segment_ids_tile_ref=None, 
-#   kv_segment_ids_tile_ref=None,
-#   use_causal_mask=False,
-#   mixed_precision=False,
-#   dropout_p=0.0,
-#   softmax_scale=None,
-# ):
+
+  GQA support Notes:
+    the spmd kernel for launching kernel should be on kv_heads instead of nheads
+
+  Example usage:
+    MHA: q: [b, h, d, s], k: [b, h, d, s], v: [b, h, s, d]
+      usage: `flash_fwd[b, h](q, k, v, ...)`
+    GQA: q: [b, h, d, s], k: [b, kv_h, d, s], v: [b, kv_h, s, d]
+      usage: `flash_fwd[b, kv_h](q, k, v, ...)`
+  """
+  config = config or FlashConfig()
+  B_F_SIZE=512
+  B_P_SIZE=128
+  b, h, d, seqlen_q  = q.shape
+  B_D_SIZE = d
+  _, k_h, _, seqlen_k = k.shape
+
+  logit_bias=None
+  
+  if config.should_transpose_v:
+    assert tuple(v.shape) == (b, k_h, d, seqlen_k), f"Expect shape of V to be {(b, k_h, d, seqlen_k)} (batch, heads, d_head, seqlen_k) but got {v.shape}"
+    assert tuple(k.shape) == (b, k_h, d, seqlen_k), f"Expect shape of K to be {(b, k_h, d, seqlen_k)} (batch, heads, d_head, seqlen_k) but got {k.shape}"
+  else:
+    assert tuple(v.shape) == (b, k_h, seqlen_k, d), f"Expect shape of V to be {(b, k_h, seqlen_k, d)} (batch, heads, seqlen_k, d_head) but got {v.shape}"
+    assert tuple(k.shape) == (b, k_h, d, seqlen_k), f"Expect shape of K to be {(b, k_h, d, seqlen_k)} (batch, heads, d_head, seqlen_k) but got {k.shape}"
+  assert d <= 128, f" we do not support head_dim > 128, got head dim {d}"
+  kernel_dtype = nl.bfloat16 if mixed_precision else q.dtype
+  acc_type = np.dtype(np.float32) if mixed_precision else kernel_dtype
+
+  if q_segment_ids_tile_ref is not None:
+    assert kv_segment_ids_tile_ref is not None, f"both q segement id and kv segment id has to be provided"
+    assert tuple(q_segment_ids_tile_ref.shape) == tuple(kv_segment_ids_tile_ref.shape), f"both q and kv segment id shape should match"
+    assert tuple(q_segment_ids_tile_ref.shape) == (b, seqlen_q), f"seqment ids shape should match {(b, seqlen_q)} but got {q_segment_ids_tile_ref.shape}"
+
+  o = nl.ndarray((b, h, seqlen_q, d), dtype=q.dtype, buffer=nl.shared_hbm)
+  if config.training:
+    if config.lse_dtype:
+      lse_dtype = getattr(nl, config.lse_dtype)
+    else:
+      lse_dtype = acc_type
+    lse = nl.ndarray((b, h, nl.tile_size.pmax, seqlen_q // nl.tile_size.pmax),
+                     dtype=lse_dtype, buffer=nl.shared_hbm)
+  else:
+    lse = None
+
+  assert nl.program_ndim() == 2,\
+    f'Expect spmd grid with 2 dimensions, got {nl.program_ndim()} instead!'
+  batch_id = nl.program_id(axis=0)
+  head_id = nl.program_id(axis=1)
+
+  softmax_scale = softmax_scale or (1.0 / (d ** 0.5))
+
+  n_tile_q = seqlen_q // B_P_SIZE # since q will be loaded on tensor engine
+
+  LARGE_TILE_SZ = config.seq_tile_size
+  attn_core_tile_size = config.attn_core_tile_size
+
+  # FIXME: Add masking for different seqlen values.
+  assert config.seq_tile_size >= 512, f" seq tile_size {config.seq_tile_size} cannot be less than 512"
+  assert seqlen_k % LARGE_TILE_SZ == 0, f"Need seqlen_k to be divisible by {LARGE_TILE_SZ} but got {seqlen_k}"
+  num_large_k_tile = seqlen_k // LARGE_TILE_SZ
+
+  # inference flag, check if lse is none
+  inference = not config.training
+  if inference:
+    assert lse is None, "lse should be none for inference"
+    assert seed is None, f"seed should be None for inference, but got {seed}"
+    assert dropout_p==0.0, f"dropout should be 0.0 for inference but got {dropout_p}"
+  else:
+    assert lse is not None, "lse should not be none for training"
+  q_h_per_k_h = h // k_h
+
+  if dropout_p > 0.0 and not inference:
+    seed_local = nl.load(seed[0])
+    # TODO: Remove this once the dropout supports scale prob
+    dropout_p_tensor = nl.full((B_P_SIZE, 1), fill_value=dropout_p, dtype=np.float32)
+  else:
+    dropout_p_tensor = None
+    seed_local = None
+
+  if logit_bias is not None:
+    b_logit_bias, h_logit_bias, _, _ = logit_bias.shape
+    assert b_logit_bias == 1 and h_logit_bias == 1, "only support broadcasting logit_bias with batch 1, n_heads 1"
+
+  n_remat = div_ceil(n_tile_q, attn_core_tile_size)
+  attn_core_tile_size = min(n_tile_q, attn_core_tile_size)
+
+  for i_q_h in nl.affine_range(q_h_per_k_h):
+    # =============== Global Flash Attention accumulators ====================== #
+    l_buffer = nl.zeros((par_dim(B_P_SIZE), n_tile_q), dtype=acc_type,
+                        buffer=nl.sbuf, lazy_initialization=True)
+    # =============== Global Flash Attention accumulators END ================== #
+
+    for i0 in nl.sequential_range(n_remat):
+      # =============== Global Flash Attention accumulators ====================== #
+      o_buffer = nl.zeros((attn_core_tile_size, par_dim(B_P_SIZE), d), dtype=acc_type,
+                          buffer=nl.sbuf, lazy_initialization=True)
+      m_buffer = nl.zeros((attn_core_tile_size, par_dim(B_P_SIZE), 1), dtype=acc_type,
+                          buffer=nl.sbuf, lazy_initialization=True)
+      # =============== Global Flash Attention accumulators END ================== #
+
+      for j in nl.sequential_range(0, num_large_k_tile):
+        cur_k_tile = nl.ndarray((par_dim(B_D_SIZE), LARGE_TILE_SZ), dtype=kernel_dtype)
+        cur_v_tile = nl.ndarray((LARGE_TILE_SZ // B_P_SIZE, par_dim(B_P_SIZE), B_D_SIZE), dtype=kernel_dtype)
+
+        cur_k_tile[:, :] = nl.load(k[batch_id, head_id, :, nl.ds(j*LARGE_TILE_SZ, LARGE_TILE_SZ)])
+
+        load_tile_size = B_P_SIZE
+
+        v_hbm_tile = v[batch_id, head_id]
+        for v_i in nl.affine_range(LARGE_TILE_SZ // load_tile_size):
+          load_v_tile(v_hbm_tile=v_hbm_tile, cur_v_tile=cur_v_tile, j=j, v_i=v_i,
+                      config=config)
+
+        for i1 in nl.affine_range(attn_core_tile_size):
+          i = i0 * attn_core_tile_size + i1
+          # mask are used to only apply computation to the lower half of the matrix,
+          # which reduce the arthimetic intensity by half.
+          # forward_mask imply initialize, i.e. if forward_mask is false, initialize will
+          # be false as well
+          if use_causal_mask:
+            forward_mask = i * B_P_SIZE >= j * LARGE_TILE_SZ
+          else:
+            forward_mask = True
+
+          if (i < n_tile_q) & forward_mask:
+            q_tile = nl.ndarray((B_D_SIZE, B_P_SIZE),dtype=kernel_dtype)
+            q_hbm_tile = q[batch_id, head_id * q_h_per_k_h + i_q_h]
+            q_sbuf_tile = nl.load(q_hbm_tile[:, nl.ds(i * B_P_SIZE, B_P_SIZE)],
+                                  dtype=kernel_dtype) # load (d, 128) tile in SBUF
+            q_tile[:, :] = q_sbuf_tile * softmax_scale
+
+            logit_bias_tile = None
+            if logit_bias is not None:
+              logit_bias_tile = nl.ndarray((par_dim(B_P_SIZE), LARGE_TILE_SZ), dtype=kernel_dtype)
+              logit_bias_tile[:, :] = nl.load(
+                logit_bias[0, 0, nl.ds(i * B_P_SIZE, B_P_SIZE),
+                           nl.ds(j * LARGE_TILE_SZ, LARGE_TILE_SZ)])
+            q_segment_ids_tile_local = None
+            kv_segment_ids_tile_local = None
+            if q_segment_ids_tile_ref is not None:
+              q_segment_ids_tile_local = nl.ndarray((par_dim(B_P_SIZE), 1), dtype=nl.float32)
+              kv_segment_ids_tile_local = nl.ndarray((par_dim(B_P_SIZE), 1), dtype=nl.float32)
+              q_segment_ids_tile_local[:,:] = nl.load(q_segment_ids_tile_ref[batch_id, nl.ds(i*B_P_SIZE, B_P_SIZE)])
+              kv_segment_ids_tile_local[:,:] = nl.load(kv_segment_ids_tile_ref[batch_id, nl.ds(i*B_P_SIZE, B_P_SIZE)])
+
+            _flash_attention_core(q_local_tile=q_tile, k=cur_k_tile, v=cur_v_tile,
+                                  q_h_per_k_h=q_h_per_k_h, seqlen_q=seqlen_q, nheads=h,
+                                  o_buffer=o_buffer[i1], l_buffer=l_buffer[:, i], m_buffer=m_buffer[i1],
+                                  batch_id=batch_id, head_id=head_id,
+                                  gqa_head_idx=i_q_h, q_tile_idx=i, local_k_large_tile_idx=j,
+                                  kernel_dtype=kernel_dtype, acc_type=acc_type,
+                                  flash_config=config, use_causal_mask=use_causal_mask,
+                                  initialize=j == 0,
+                                  B_P_SIZE=B_P_SIZE, B_F_SIZE=B_F_SIZE, B_D_SIZE=B_D_SIZE,
+                                  dropout_p=dropout_p, dropout_p_tensor=dropout_p_tensor,
+                                  seed_tensor=seed_local, logit_bias_tile=logit_bias_tile, 
+                                  q_segment_ids_tile_local=q_segment_ids_tile_local,
+                                  kv_segment_ids_tile_local=kv_segment_ids_tile_local)
+
+      # -------- write output to buffer on HBM ------------ #
+      for i1 in nl.affine_range(attn_core_tile_size):
+        i = i0 * attn_core_tile_size + i1
+
+        if i < n_tile_q:
+          exp = nisa.activation(np.exp, l_buffer[:, i], bias=m_buffer[i1, :, :],
+                                scale=-1.0)
+          out = nl.multiply(o_buffer[i1, :, :], exp,
+                            dtype=kernel_dtype)
+
+          nl.store(o[batch_id, head_id * q_h_per_k_h + i_q_h,
+                     nl.ds(i*B_P_SIZE, B_P_SIZE), :], out)
+
+    if not inference:
+      nl.store(lse[batch_id, head_id * q_h_per_k_h + i_q_h, :, :], l_buffer[:, :])
+
+  if config.training:
+    return o, lse
+
+  return o
+
+
+
 @nki.jit
 def flash_attn_bwd(
+  q_ref, k_ref, v_ref, o_ref,
+  dy_ref,
+  lse_ref,
+  seed_ref,
+  logit_bias_ref=None,
+  q_segment_ids_tile_ref=None, 
+  kv_segment_ids_tile_ref=None,
+  use_causal_mask=False,
+  mixed_precision=False,
+  dropout_p=0.0,
+  softmax_scale=None,
+):
+  """
+  Flash attention backward kernel. Compute the backward gradients.
+
+  IO tensor layouts:
+   - q_ref: shape (bs, nheads, head_size, seq)
+   - k_ref: shape (bs, nheads, head_size, seq)
+   - v_ref: shape (bs, nheads, head_size, seq)
+   - o_ref: shape (bs, nheads, head_size, seq)
+   - dy_ref: shape (bs, nheads, head_size, seq)
+   - lse_ref: shape (bs, nheads, nl.tile_size.pmax, seq // nl.tile_size.pmax)
+   - seed_ref: shape (1,)
+   - logit_bias_ref: shape (bs, n_heads, seq_q, seq_k)
+   - q_segment_ids_tile_ref: (bs, seq_q)
+   - kv_segment_ids_tile_ref: (bs, seq_k)
+   - out_dq_ref: shape (bs, nheads, head_size, seq)
+   - out_dk_ref: shape (bs, nheads, head_size, seq)
+   - out_dv_ref: shape (bs, nheads, head_size, seq)
+
+  Detailed steps:
+    1. D = rowsum(dO ◦ O) (pointwise multiply)
+
+    2. Recompute (softmax(Q^T@K + logic_bias))
+
+      2.1 Q^T@K
+      2.2 Scale the QK score
+      2.3 Apply causal mask and add logit_bias
+      2.4 softmax
+
+    3. Compute the gradients of y = score @ V with respect to the loss
+
+    4. Compute the gradients of y = softmax(x)
+
+    5. Compute the gradients of Q^T@K
+
+      4.1 Compute dQ
+      4.2 Compute dK
+  """
+
+  # Use q_ref dtype as the intermediate tensor dtype
+  # Assume all IO tensors have the same dtype
+  kernel_dtype = q_ref.dtype
+  mixed_dtype = np.dtype(np.float32) if mixed_precision else kernel_dtype
+
+  assert q_ref.dtype == k_ref.dtype == v_ref.dtype == o_ref.dtype == dy_ref.dtype
+
+  # Shape checking
+  bs, nheads, d_head, seqlen_q = q_ref.shape
+  _, _, _, seqlen_k = k_ref.shape
+  assert tuple(k_ref.shape) == (bs, nheads, d_head, seqlen_k), \
+    f"Input K shape mismatch, got {k_ref.shape}"
+  assert tuple(v_ref.shape) == (bs, nheads, d_head, seqlen_k), \
+    f"Input V shape mismatch, got {v_ref.shape}"
+  assert tuple(o_ref.shape) == (bs, nheads, d_head, seqlen_q), \
+    f"Input o shape mismatch, got {o_ref.shape}"
+  assert tuple(dy_ref.shape) == (bs, nheads, d_head, seqlen_q), \
+    f"Input dy shape mismatch, got {dy_ref.shape}"
+  assert tuple(lse_ref.shape) == (bs, nheads, nl.tile_size.pmax, seqlen_q // nl.tile_size.pmax), \
+    f"Input lse shape mismatch, got {lse_ref.shape}"
+  if seed_ref is not None:
+    assert tuple(seed_ref.shape) == (1,), \
+      f"Input seed shape mismatch, got {seed_ref.shape}"
+
+  if q_segment_ids_tile_ref is not None:
+    assert kv_segment_ids_tile_ref is not None, f"both q segement id and kv segment id has to be provided"
+    assert tuple(q_segment_ids_tile_ref.shape) == tuple(kv_segment_ids_tile_ref.shape), f"both q and kv segment id shape should match"
+    assert tuple(q_segment_ids_tile_ref.shape) == (bs, seqlen_q), f"seqment ids shape should match {(bs, seqlen_q)} but got {q_segment_ids_tile_ref.shape}"
+
+  out_dq_ref = nl.ndarray((bs, nheads, d_head, seqlen_q), dtype=q_ref.dtype,
+                          buffer=nl.shared_hbm)
+  out_dk_ref = nl.ndarray((bs, nheads, d_head, seqlen_k), dtype=q_ref.dtype,
+                          buffer=nl.shared_hbm)
+  out_dv_ref = nl.ndarray((bs, nheads, d_head, seqlen_k), dtype=q_ref.dtype,
+                          buffer=nl.shared_hbm)
+
+  # FIXME: Add masking for different seqlen values.
+  assert seqlen_q % 128 == 0 and seqlen_k % 128 == 0, \
+    f"Input sequence lengths must be divisible by 128, got seqlen_q == {seqlen_q} and seqlen_k == {seqlen_k}"
+
+  # Softmax scaling factor, multiplied onto Q
+  softmax_scale = softmax_scale or 1.0 / float(d_head ** 0.5)
+
+  assert nl.program_ndim() == 2,\
+    f'Expect spmd grid with 2 dimensions, got {nl.program_ndim()} instead!'
+  # Different batch samples/attention heads have independent attention
+  batch_id = nl.program_id(axis=0)
+  head_id = nl.program_id(axis=1)
+
+  assert nl.num_programs(1) == nheads, \
+    f"The grid shape mismatch, got {nl.num_programs(1)} but should be {nheads}"
+
+  if logit_bias_ref is not None:
+    b_logit_bias, h_logit_bias, _, _ = logit_bias_ref.shape
+    assert b_logit_bias == 1 and h_logit_bias == 1, "Only support broadcasting logit_bias with batch 1, n_heads 1"
+
+  q_seq_n_tiles, q_seq_tile_size = div_ceil(seqlen_q, 128), 128
+  d_head_n_tiles, d_head_tile_size = div_ceil(d_head, 128), min(d_head, 128)
+
+  if seqlen_k >= 512:
+    k_seq_n_tiles, k_seq_tile_size = seqlen_k // 512, 512
+  else:
+    k_seq_n_tiles, k_seq_tile_size = seqlen_k // 128, 128
+
+  k_seq_n_tiles_backward, k_seq_tile_size_backward = seqlen_k // 128, 128
+  k_seq_fwd_bwd_tile_multipler = k_seq_tile_size // k_seq_tile_size_backward
+
+  ##############################################################
+  # Step 2.4 Prefetch exp bias for softmax
+  ##############################################################
+  softmax_exp_bias = nl.zeros((par_dim(q_seq_tile_size), q_seq_n_tiles), dtype=mixed_dtype)
+  lse_local = nl.load(lse_ref[batch_id, head_id, :, :], dtype=mixed_dtype)
+  softmax_exp_bias[:, :] = lse_local * -1.0
+
+  ##############################################################
+  # Step 1 Compute rowsum(dO ◦ O)
+  ##############################################################
+  dy_o_sum = nl.ndarray((q_seq_n_tiles, par_dim(q_seq_tile_size), 1), dtype=mixed_dtype)
+  compute_rowsum(dy_o_sum=dy_o_sum,
+                 dy_ref_hbm_tile=dy_ref[batch_id, head_id],
+                 o_ref_hbm_tile=o_ref[batch_id, head_id],
+                 d_head_n_tiles=d_head_n_tiles, d_head_tile_size=d_head_tile_size,
+                 q_seq_n_tiles=q_seq_n_tiles, q_seq_tile_size=q_seq_tile_size)
+
+  if dropout_p > 0.0:
+    seed_local = nl.load(seed_ref[0])
+    # TODO: Remove this once the dropout supports scale prob
+    dropout_p_local = nl.full((q_seq_tile_size, 1), fill_value=dropout_p, dtype=np.float32)
+  else:
+    seed_local = None
+    dropout_p_local = None
+
+  dq_local_reduced = nl.zeros((q_seq_n_tiles, d_head_n_tiles, par_dim(d_head_tile_size), q_seq_tile_size),
+                              dtype=mixed_dtype)
+
+  # affine_range give the compiler permission to vectorize instructions
+  # inside the loop which improves the performance. However, when using the
+  # the dropout we should use sequential_range to avoid setting
+  # seed vectorization. TODO: the compiler should avoid vectorizing seed setting
+  _range = nl.sequential_range if dropout_p > 0.0 else nl.affine_range
+
+  for i_k_seq_tile in nl.affine_range(k_seq_n_tiles):
+    i_k_seq_dslice = nl.ds(i_k_seq_tile * k_seq_tile_size, k_seq_tile_size)
+
+    # Prefetch V, K
+    v_local = nl.zeros((d_head_n_tiles, par_dim(d_head_tile_size), k_seq_tile_size),
+                       dtype=kernel_dtype)
+    k_local = nl.zeros((d_head_n_tiles, par_dim(d_head_tile_size), k_seq_tile_size),
+                       dtype=kernel_dtype)
+    transposed_k_local = nl.zeros((k_seq_fwd_bwd_tile_multipler, d_head_n_tiles,
+                                   par_dim(k_seq_tile_size_backward), d_head_tile_size),
+                                  dtype=kernel_dtype)
+
+    load_kv(k_ref_hbm_tile=k_ref[batch_id, head_id],
+            v_ref_hbm_tile=v_ref[batch_id, head_id],
+            k_local=k_local, transposed_k_local=transposed_k_local, v_local=v_local,
+            d_head_n_tiles=d_head_n_tiles, d_head_tile_size=d_head_tile_size,
+            i_k_seq_tile=i_k_seq_tile, k_seq_tile_size=k_seq_tile_size,
+            k_seq_tile_size_backward=k_seq_tile_size_backward)
+
+    # FIXME: Pass sbuf instead, we will have psum spilling in the current implementation
+    dv_psum = nl.zeros((d_head_n_tiles, par_dim(d_head_tile_size), k_seq_tile_size),
+                        dtype=np.float32, buffer=nl.psum)
+    dk_psum = nl.zeros((d_head_n_tiles, par_dim(d_head_tile_size), k_seq_tile_size),
+                        dtype=np.float32, buffer=nl.psum)
+    for i_q_seq_tile in _range(q_seq_n_tiles):
+      # Prefetch dy, Q
+      dy_local = nl.zeros((d_head_n_tiles, par_dim(d_head_tile_size), q_seq_tile_size), dtype=kernel_dtype)
+      q_local = nl.zeros((d_head_n_tiles, par_dim(d_head_tile_size), q_seq_tile_size), dtype=kernel_dtype)
+
+      load_dy_q(dy_ref_hbm_tile = dy_ref[batch_id, head_id],
+                q_ref_hbm_tile = q_ref[batch_id, head_id],
+                dy_local=dy_local, q_local=q_local, d_head_n_tiles=d_head_n_tiles,
+                d_head_tile_size=d_head_tile_size, i_q_seq_tile=i_q_seq_tile,
+                q_seq_tile_size=q_seq_tile_size, softmax_scale=softmax_scale)
+
+      logit_bias_tile = None
+      if logit_bias_ref is not None:
+        i_q_seq_dslice = nl.ds(i_q_seq_tile * q_seq_tile_size, q_seq_tile_size)
+        logit_bias_tile = nl.ndarray((par_dim(q_seq_tile_size), k_seq_tile_size),
+                                     buffer=nl.sbuf, dtype=kernel_dtype)
+        logit_bias_tile[:, :] = nl.load(
+          logit_bias_ref[0, 0, i_q_seq_dslice, i_k_seq_dslice])
+      q_segment_ids_tile_local = None
+      kv_segment_ids_tile_local = None
+      if q_segment_ids_tile_ref is not None:
+        q_segment_ids_tile_local = nl.ndarray((par_dim(q_seq_tile_size), 1), dtype=nl.float32)
+        kv_segment_ids_tile_local = nl.ndarray((par_dim(q_seq_tile_size), 1), dtype=nl.float32)
+        i_q_seq_dslice = nl.ds(i_q_seq_tile * q_seq_tile_size, q_seq_tile_size)
+        q_segment_ids_tile_local[:,:] = nl.load(q_segment_ids_tile_ref[batch_id, i_q_seq_dslice])
+        kv_segment_ids_tile_local[:,:] = nl.load(kv_segment_ids_tile_ref[batch_id, i_q_seq_dslice])
+
+      _flash_attn_bwd_core(
+        q_local=q_local, k_local=k_local, transposed_k_local=transposed_k_local,
+        v_local=v_local, dy_local=dy_local,
+        dk_psum=dk_psum, dv_psum=dv_psum, dq_local_reduced=dq_local_reduced,
+        softmax_exp_bias=softmax_exp_bias, dy_o_sum=dy_o_sum,
+        local_i_q_seq_tile=i_q_seq_tile, local_i_k_seq_tile=i_k_seq_tile,
+        seqlen_q=seqlen_q, seqlen_k=seqlen_k, d_head=d_head, nheads=nheads,
+        use_causal_mask=use_causal_mask,
+        kernel_dtype=kernel_dtype, mixed_dtype=mixed_dtype,
+        softmax_scale=softmax_scale,
+        seed_local=seed_local, dropout_p=dropout_p, dropout_p_local=dropout_p_local,
+        logit_bias_tile=logit_bias_tile,
+        q_segment_ids_tile_local=q_segment_ids_tile_local,
+        kv_segment_ids_tile_local=kv_segment_ids_tile_local
+      )
+
+    # Write dK, dV
+    store_dk_dv(out_dk_ref_hbm_tile=out_dk_ref[batch_id, head_id],
+                out_dv_ref_hbm_tile=out_dv_ref[batch_id, head_id],
+                local_dk=dk_psum, local_dv=dv_psum, i_k_seq_dslice=i_k_seq_dslice,
+                d_head_n_tiles=d_head_n_tiles, d_head_tile_size=d_head_tile_size)
+
+  # Write dQ
+  for i_q_seq_tile in nl.affine_range(q_seq_n_tiles):
+    for i_d_head_tile in nl.affine_range(d_head_n_tiles):
+      i_q_seq_dslice = nl.ds(i_q_seq_tile * q_seq_tile_size, q_seq_tile_size)
+      i_d_head_dslice = nl.ds(i_d_head_tile * d_head_tile_size, d_head_tile_size)
+      nl.store(
+        out_dq_ref[batch_id, head_id, i_d_head_dslice, i_q_seq_dslice],
+        value=dq_local_reduced[i_q_seq_tile, i_d_head_tile, :, :],
+      )
+
+  return out_dq_ref, out_dk_ref, out_dv_ref
+
+
+@nki.jit
+def flash_attn_bwd_no_bias(
   q_ref, k_ref, v_ref, o_ref,
   dy_ref,
   lse_ref,
@@ -697,6 +1141,8 @@ def flash_attn_bwd(
   # Assume all IO tensors have the same dtype
   kernel_dtype = q_ref.dtype
   mixed_dtype = np.dtype(np.float32) if mixed_precision else kernel_dtype
+
+  logit_bias_ref = None
 
   assert q_ref.dtype == k_ref.dtype == v_ref.dtype == o_ref.dtype == dy_ref.dtype
 
