@@ -12,7 +12,7 @@ import jax.numpy as jnp
 import jax_neuronx  # pylint: disable=unused-import
 import neuronxcc.nki.language as nl
 from jax import custom_vjp
-from axlearn.common.flash_attention.neuron_seq_packing_attention import flash_attn_bwd, flash_attn_bwd_no_bias, flash_fwd, flash_fwd_no_bias
+from axlearn.common.flash_attention.neuron_seq_packing_attention import flash_attn_bwd, flash_attn_bwd_no_bias, flash_fwd, flash_fwd_no_bias, nki_asm_get_sequence_bounds
 from neuronxcc import nki
 from neuronxcc.nki import jit as nki_jit
 from jax_neuronx import nki_call
@@ -24,16 +24,17 @@ lnc = 2 if jax.devices()[0].device_kind == "NC_v3d" else 1
 
 # TODO(apoorvtintin): Add segment IDs as an argument when the kernel supports it.
 
-@partial(custom_vjp, nondiff_argnums=(7, 8, 9))
-# @partial(custom_vjp, nondiff_argnums=(5, 6, 7))
+# @partial(custom_vjp, nondiff_argnums=(7, 8, 9))
+@partial(custom_vjp, nondiff_argnums=(6, 7, 8))
 def flash_attention(
     query: Tensor,
     key: Tensor,
     value: Tensor,
     bias: Optional[Tensor] = None,
     prng_key: Optional[Tensor] = None,
-    q_segment_ids_tile_ref: Optional[Tensor] = None,
-    kv_segment_ids_tile_ref: Optional[Tensor] = None,
+    segment_ids: Optional[Tensor] = None,
+    # q_segment_ids_tile_ref: Optional[Tensor] = None,
+    # kv_segment_ids_tile_ref: Optional[Tensor] = None,
     causal: bool = False,
     softmax_scale: float = 1.0,
     dropout_rate: float = 0.0,
@@ -54,7 +55,7 @@ def flash_attention(
         The attention outputs of shape [batch_size, target_length, num_heads, per_head_dim].
     """
     # out, _ = _mha_forward(query, key, value, bias, prng_key, causal, softmax_scale, dropout_rate)
-    out, _ = _mha_forward(query, key, value, bias, prng_key, q_segment_ids_tile_ref, kv_segment_ids_tile_ref, causal, softmax_scale, dropout_rate)
+    out, _ = _mha_forward(query, key, value, bias, prng_key, segment_ids, causal, softmax_scale, dropout_rate)
     return out
 
 
@@ -64,10 +65,9 @@ def _mha_forward(
     value: Tensor,
     bias: Tensor,
     prng_key: Tensor,
-    # segment_ids: Tensor | None,
-    # segment_ids_kv: Tensor | None,
-    q_segment_ids_tile_ref: Tensor | None,
-    kv_segment_ids_tile_ref: Tensor | None,
+    segment_ids: Tensor | None,
+    # q_segment_ids_tile_ref: Tensor | None,
+    # kv_segment_ids_tile_ref: Tensor | None,
     causal: bool,
     softmax_scale: float,
     dropout_rate: float,
@@ -118,7 +118,18 @@ def _mha_forward(
     else:
         grid = batch_size, num_heads
 
-    # if bias is not None and q_segment_ids_tile_ref is None:
+    # FIXME: Only works for batch size 1
+    reshaped_segment_ids = segment_ids[:, None, :]  # Add two singleton dimensions to [batch_size(must be 1), 1, q_seq_len]
+    # batched_nki_asm_get_sequence_bounds = jax.vmap(nki_asm_get_sequence_bounds, in_axes=(0, None))
+    partial_nki_asm_get_sequence_bounds = partial(nki_asm_get_sequence_bounds, output_tensor_dtype=nl.float32)
+    # processed_segment_ids = nki_asm_get_sequence_bounds(reshaped_segment_ids, nl.float32)
+    processed_segment_ids = partial_nki_asm_get_sequence_bounds(reshaped_segment_ids)
+    q_segment_ids_tile_ref = processed_segment_ids[:, :, :q_seq_len].reshape((batch_size, q_seq_len))
+    kv_segment_ids_tile_ref = processed_segment_ids[:, :, -q_seq_len:].reshape((batch_size, q_seq_len))
+
+    q_segment_ids_tile_ref = jnp.asarray(q_segment_ids_tile_ref)
+    kv_segment_ids_tile_ref = jnp.asarray(kv_segment_ids_tile_ref)
+
     if bias is not None:
         if bias.ndim != 4:
             raise ValueError(
@@ -250,7 +261,7 @@ def _mha_backward(
     d_value = d_value.transpose(0, 3, 1, 2)  # [batch_size, kv_seq_len, num_heads, d_model]
 
     # return d_query, d_key, d_value, None, None
-    return d_query, d_key, d_value, None, None, None, None
+    return d_query, d_key, d_value, None, None, None
 
 
 flash_attention.defvjp(_mha_forward, _mha_backward)
