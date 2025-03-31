@@ -118,17 +118,20 @@ def _mha_forward(
     else:
         grid = batch_size, num_heads
 
-    # FIXME: Only works for batch size 1
-    reshaped_segment_ids = segment_ids[:, None, :]  # Add two singleton dimensions to [batch_size(must be 1), 1, q_seq_len]
-    # batched_nki_asm_get_sequence_bounds = jax.vmap(nki_asm_get_sequence_bounds, in_axes=(0, None))
-    partial_nki_asm_get_sequence_bounds = partial(nki_asm_get_sequence_bounds, output_tensor_dtype=nl.float32)
-    # processed_segment_ids = nki_asm_get_sequence_bounds(reshaped_segment_ids, nl.float32)
-    processed_segment_ids = partial_nki_asm_get_sequence_bounds(reshaped_segment_ids)
-    q_segment_ids_tile_ref = processed_segment_ids[:, :, :q_seq_len].reshape((batch_size, q_seq_len))
-    kv_segment_ids_tile_ref = processed_segment_ids[:, :, -q_seq_len:].reshape((batch_size, q_seq_len))
+    if segment_ids is not None:
+        # FIXME: Only works for batch size 1
+        reshaped_segment_ids = segment_ids[:, None, :]  # Add two singleton dimensions to [batch_size(must be 1), 1, q_seq_len]
+        # batched_nki_asm_get_sequence_bounds = jax.vmap(nki_asm_get_sequence_bounds, in_axes=(0, None))
+        partial_nki_asm_get_sequence_bounds = partial(nki_asm_get_sequence_bounds, output_tensor_dtype=nl.float32)
+        # processed_segment_ids = nki_asm_get_sequence_bounds(reshaped_segment_ids, nl.float32)
+        processed_segment_ids = partial_nki_asm_get_sequence_bounds[(batch_size,)](reshaped_segment_ids)
+        q_segment_ids_tile_ref = processed_segment_ids[:, :, :q_seq_len].reshape((batch_size, q_seq_len))
+        kv_segment_ids_tile_ref = processed_segment_ids[:, :, -q_seq_len:].reshape((batch_size, q_seq_len))
 
-    q_segment_ids_tile_ref = jnp.asarray(q_segment_ids_tile_ref)
-    kv_segment_ids_tile_ref = jnp.asarray(kv_segment_ids_tile_ref)
+        q_segment_ids_tile_ref = jnp.asarray(q_segment_ids_tile_ref)
+        kv_segment_ids_tile_ref = jnp.asarray(kv_segment_ids_tile_ref)
+    else:
+        q_segment_ids_tile_ref, kv_segment_ids_tile_ref = None, None
 
     if bias is not None:
         if bias.ndim != 4:

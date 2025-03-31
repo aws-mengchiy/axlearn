@@ -80,31 +80,43 @@ def dropout_p_local(p_local, dropout_p, dropout_p_tensor, seed_tensor,
     p_local[:, p_local_f_slice] = nl.multiply(
       softmax_dropout, 1 / (1 - dropout_p))
 
-
+@nki.jit
 def nki_asm_get_sequence_bounds(input_tensor, output_tensor_dtype):
+    """
 
-    input_tensor_shape  = input_tensor.shape
-    output_tensor_shape = (input_tensor_shape[0], input_tensor_shape[1], 2*input_tensor_shape[2])
-    print(f"input shape {input_tensor_shape}")
-    bound_output = nl.ndarray(output_tensor_shape, dtype=output_tensor_dtype, buffer=nl.hbm)
+    Args:
+        input_tensor: pre-processed semgment ids of shape [bs, 1, seqlen]
+        output_tensor_dtype:
 
-    input_sequence = nl.load(input_tensor)
-    tmp = nl.ndarray(output_tensor_shape, dtype=output_tensor_dtype)
+    Returns:
+        tensor of processed segment ids of shape [bs, 1, 2*seqlen]
+
+    Kernel grid spec: kernel[(bs, )](...)
+    """
+    input_tensor_shape = input_tensor.shape
+    batch_size, _, seq_len = input_tensor_shape
+    batch_idx = nl.program_id(axis=0)
+    assert nl.num_programs(0) == batch_size, f"grid size should match batch size  {input_tensor_shape[0]}"
+    output_tensor_shape = (input_tensor_shape[0], input_tensor_shape[1], 2 * input_tensor_shape[2])
+    bound_output = nl.ndarray(output_tensor_shape, dtype=output_tensor_dtype, buffer=nl.shared_hbm)
+
+    input_sequence = nl.load(input_tensor[batch_idx, :, :])
+    tmp = nl.ndarray((1, 2 * seq_len), dtype=output_tensor_dtype)
 
     # INT32 = 0x8
     # FP32 = 0xa
-    input_tpb_dtype = '8' if input_tensor.dtype==np.int32 else 'a'
-    output_tpb_dtype = '8' if output_tensor_dtype==np.int32 else 'a'
+    input_tpb_dtype = '8' if input_tensor.dtype == np.int32 else 'a'
+    output_tpb_dtype = '8' if output_tensor_dtype == np.int32 else 'a'
 
     inline_bytes = (
-            f"f0_10_00_00_{{events:NEURON_ISA_TBP_EVENTS:DATAPATH}}_05_05_0{input_tpb_dtype}_0{output_tpb_dtype}_"
-            "{srcs[0]:NEURON_ISA_TPB_TENSOR3D}_{dsts[0]:NEURON_ISA_TPB_TENSOR3D}_"
-            "00_00_00_00_00_00_00_00_00_00_00_00_00_00_00_00"
-            )
+        f"f0_10_00_00_{{events:NEURON_ISA_TBP_EVENTS:DATAPATH}}_05_05_0{input_tpb_dtype}_0{output_tpb_dtype}_"
+        "{srcs[0]:NEURON_ISA_TPB_TENSOR3D}_{dsts[0]:NEURON_ISA_TPB_TENSOR3D}_"
+        "00_00_00_00_00_00_00_00_00_00_00_00_00_00_00_00"
+    )
 
     inline_asm_bytes(dsts=[tmp], srcs=[input_sequence], engine=nisa.gpsimd_engine, asm_bytes=inline_bytes)
 
-    nl.store(bound_output, value=tmp)
+    nl.store(bound_output[batch_idx, :, :], value=tmp)
     return bound_output
 
 
@@ -398,6 +410,15 @@ def flash_fwd(q, k, v, seed, logit_bias,
               use_causal_mask=True,
               mixed_precision=True,
               dropout_p=0.0, config=None):
+
+# @nki.jit
+# def flash_fwd(q, k, v, seed,
+#               q_segment_ids_tile_ref=None, 
+#               kv_segment_ids_tile_ref=None,
+#               softmax_scale=None,
+#               use_causal_mask=True,
+#               mixed_precision=True,
+#               dropout_p=0.0, logit_bias=None, config=None):
   """
   Flash Attention Forward kernel
 

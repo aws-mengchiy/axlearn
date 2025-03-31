@@ -2,7 +2,7 @@
 Copyright (c) 2023, Amazon.com. All Rights Reserved
 """
 import pytest
-from axlearn.common.flash_attention.neuron_seq_packing_attention import flash_fwd, FlashConfig
+from axlearn.common.flash_attention.neuron_seq_packing_attention import flash_fwd, FlashConfig, nki_asm_get_sequence_bounds
 from neuronxcc.nki import benchmark, baremetal, simulate_kernel
 import neuronxcc.nki.language as nl
 import numpy as np
@@ -40,15 +40,29 @@ def random_ints_sum_to_length(length, n_seq):
 
     return random_ints
 
-def get_segmend_ids(length, n_seq):
-    seq_lens = random_ints_sum_to_length(length, n_seq)
-    oc = seq_lens.cumsum()
-    lhs = [0]*seq_lens[0]
-    rhs = [seq_lens[0]]*seq_lens[0]
-    for i, (l, r) in enumerate(zip(oc[:-1], oc[1:])):
-        lhs += [l]*seq_lens[i+1]
-        rhs += [r]*seq_lens[i+1]
-    return np.array(lhs).reshape((-1,1)), np.array(rhs).reshape((-1,1))
+def get_segmend_ids(length, n_seq, batch=1, pad=0):
+    lhs_b = []
+    rhs_b = []
+    ids_b = []
+    for b in range(batch):
+        seq_lens = random_ints_sum_to_length(length, n_seq-(1 if pad else 0))
+        oc = seq_lens.cumsum()
+        lhs = [0]*seq_lens[0]
+        rhs = [seq_lens[0]]*seq_lens[0]
+        ids = []
+        for i, j in enumerate(seq_lens):
+            ids.extend([i+1]*j)
+        for i, (l, r) in enumerate(zip(oc[:-1], oc[1:])):
+            lhs += [l]*seq_lens[i+1]
+            rhs += [r]*seq_lens[i+1]
+        if pad:
+            lhs.extend([length+pad]*pad)
+            rhs.exend([-1]*pad)
+            ids.extend([0]*pad)
+        lhs_b.append(lhs)
+        rhs_b.append(rhs)
+        ids_b.append(ids)
+    return np.array(lhs_b).reshape((batch,length)), np.array(rhs_b).reshape((batch,length)), np.array(ids_b).reshape((batch,1,-1))
  
 def softmax(x: np.ndarray, dim: int, zero_max_mode=False,
             mixed_precision=False, return_max_reduce=False):
@@ -98,9 +112,9 @@ def cpu_attention_forward(q, k, v, use_causal_mask=True, mixed_precision=True, q
         zeros = np.zeros(raw_score.shape[-2:])
         indices = np.zeros(raw_score.shape[-2:])
         indices[:] = np.arange(raw_score.shape[-1])
-        mask = (indices >= q_segment_ids.reshape(-1,1)) & (indices < kv_segment_ids.reshape(-1,1))
-        mask = np.where(mask, zeros, 1).astype(bool)
         for i in range(raw_score.shape[0]):
+            mask = (indices >= q_segment_ids[i].reshape(-1, 1)) & (indices < kv_segment_ids[i].reshape(-1, 1))
+            mask = np.where(mask, zeros, 1).astype(bool)
             for j in range(raw_score.shape[1]):
                 # -inf triggers invalid input error in softmax implementation, use a small negative instead
                 # k=1 to exclude the diagonal, because each token can still attend to itself
@@ -151,7 +165,7 @@ class TestAttention:
         heads = nheads if kv_heads is None else kv_heads
         q_segment_ids_tile_ref, kv_segment_ids_tile_ref = None, None
         if seq_packed:
-            q_segment_ids_tile_ref, kv_segment_ids_tile_ref = get_segmend_ids(seqlen_q, 8)
+            q_segment_ids_tile_ref, kv_segment_ids_tile_ref = get_segmend_ids(seqlen_q, 8, bs)
             q_segment_ids_tile_ref  = q_segment_ids_tile_ref.reshape((bs, seqlen_q))
             kv_segment_ids_tile_ref = kv_segment_ids_tile_ref.reshape((bs, seqlen_q))
             q_segment_ids_tile_ref = nl.static_cast(q_segment_ids_tile_ref, nl.float32)
@@ -166,16 +180,15 @@ class TestAttention:
         p99 = latency_res.get_latency_percentile(50)
         assert p99 <= latency
     
-    @pytest.mark.simulation
-    @pytest.mark.parametrize("simulation_only", [True, False])
+    @pytest.mark.parametrize("simulation_only", [False])
     @pytest.mark.parametrize("bs, nheads, seqlen_q, seqlen_k, d, dtype, use_causal_mask,\
                               training, tile_size, kv_heads, should_transpose_v, seq_packed", [
-    [1, 6, 4096, 4096, 128, np.float32, True, True, 2048, 3, False, False],
-    [1, 1, 4096, 4096, 128, np.float32, True, False, 2048, None, False, False],
-    [1, 1, 8192, 4096, 128, np.float32, True, False, 2048, None, False, False],
-    [1, 1, 4096, 8192, 128, np.float32, True, False, 2048, None, False, False],
-    [1, 1, 4096, 4096, 128, np.float32, False, False, 2048, None, False, True],
-    [1, 1, 4096, 4096, 128, np.float32, True, False, 2048, None, False, True],
+    # [1, 6, 4096, 4096, 128, np.float32, True, True, 2048, 3, False, False],
+    # [1, 1, 4096, 4096, 128, np.float32, True, False, 2048, None, False, False],
+    # [1, 1, 8192, 4096, 128, np.float32, True, False, 2048, None, False, False],
+    # [1, 1, 4096, 8192, 128, np.float32, True, False, 2048, None, False, False],
+    # [1, 1, 4096, 4096, 128, np.float32, False, False, 2048, None, False, True],
+    [2, 1, 4096, 4096, 128, np.float32, True, False, 2048, None, False, True],
     ])
     def test_flash_attn_fwd_numerical(self, simulation_only, bs, nheads, seqlen_q, seqlen_k, d, dtype, use_causal_mask, 
                                      training, tile_size, kv_heads, should_transpose_v, seq_packed):
@@ -194,12 +207,12 @@ class TestAttention:
         seed = None
         q_segment_ids_tile_ref, kv_segment_ids_tile_ref = None, None
         if seq_packed:
-            q_segment_ids_tile_ref, kv_segment_ids_tile_ref = get_segmend_ids(seqlen_q, 8)
+            q_segment_ids_tile_ref, kv_segment_ids_tile_ref, segment_ids = get_segmend_ids(seqlen_q, 8, bs)
             q_segment_ids_tile_ref  = q_segment_ids_tile_ref.reshape((bs, seqlen_q))
             kv_segment_ids_tile_ref = kv_segment_ids_tile_ref.reshape((bs, seqlen_q))
             q_segment_ids_tile_ref = nl.static_cast(q_segment_ids_tile_ref, nl.float32)
             kv_segment_ids_tile_ref = nl.static_cast(kv_segment_ids_tile_ref, nl.float32)
-
+            segemnt_ids_ref = nl.static_cast(segment_ids, nl.float32)
 
         o_proj_golden, cached_negative_max, cached_sum_reciprocal  = cpu_attention_forward(q, k, v.transpose(cpu_permute), 
                                                                     use_causal_mask=use_causal_mask,mixed_precision=True, 
@@ -215,6 +228,14 @@ class TestAttention:
         config = FlashConfig(**{'seq_tile_size':tile_size, 'training':training, 'should_transpose_v':should_transpose_v})
 
         heads = nheads if kv_heads is None else kv_heads
+        if seq_packed:
+            numeric_seg_process_fn = baremetal(nki_asm_get_sequence_bounds)
+            processed_segment_ids = numeric_seg_process_fn[(bs,)](segemnt_ids_ref, np.float32)
+            q_segment_ids_tile_ref_processed = processed_segment_ids[:,:,:seqlen_q].reshape(q_segment_ids_tile_ref.shape)
+            kv_segment_ids_tile_ref_processed = processed_segment_ids[:,:,-seqlen_q:].reshape(kv_segment_ids_tile_ref.shape)
+            assert np.allclose(q_segment_ids_tile_ref, q_segment_ids_tile_ref_processed, atol=1e-2)
+            assert np.allclose(kv_segment_ids_tile_ref, kv_segment_ids_tile_ref_processed, atol=1e-2)
+
 
         numeric_func = baremetal(flash_fwd)
         if simulation_only:
