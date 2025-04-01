@@ -95,7 +95,7 @@ def test_fwd_against_ref(
 ):
     # On demand import only if test is needed.
     # pylint: disable=import-outside-toplevel
-    from neuron_attention import flash_attention
+    from axlearn.common.flash_attention.neuron_attention import flash_attention
     from axlearn.common.flash_attention.neuron_seq_packing_attention import nki_asm_get_sequence_bounds
  
     softmax_scale = per_head_dim**-0.5
