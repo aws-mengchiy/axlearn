@@ -8,6 +8,8 @@ import pytest
 from functools import partial
 
 from axlearn.common.flash_attention.utils import mha_reference
+from axlearn.common.flash_attention.neuron_attention import flash_attention
+from axlearn.common.flash_attention.neuron_seq_packing_attention import nki_asm_get_sequence_bounds
 
 if jax.default_backend() != "neuron":
     pytestmark = pytest.skip(
@@ -67,25 +69,53 @@ def get_segment_ids(batch_size, length, n_seq):
     
     return seq_lens, np.array(lhs_batch), np.array(rhs_batch), np.array(segment_ids_batch)+1
 
+@partial(jax.jit, static_argnums=[0, 1])
+def preprocessing_wrapper(batch_size, seq_len):
+
+    seq_lens, q_segment_ids_tile_ref, kv_segment_ids_tile_ref, segment_ids_batch = get_segment_ids(batch_size, seq_len, 8)
+    segment_ids_batch = jnp.asarray(segment_ids_batch)
+
+    reshaped_segment_ids = segment_ids_batch[:, None, :]  # Add two singleton dimensions to [batch_size, 1, q_seq_len]
+    reshaped_segment_ids = nl.static_cast(reshaped_segment_ids, nl.float32)
+    partial_nki_asm_get_sequence_bounds = partial(nki_asm_get_sequence_bounds[(batch_size,)], output_tensor_dtype=nl.float32)
+    processed_segment_ids = partial_nki_asm_get_sequence_bounds(reshaped_segment_ids)
+    processed_segment_ids = jnp.asarray(processed_segment_ids)
+
+    q_segment_ids_tile_ref_pre = processed_segment_ids[:, :, :seq_len].reshape((batch_size, seq_len))
+    kv_segment_ids_tile_ref_pre = processed_segment_ids[:, :, -seq_len:].reshape((batch_size, seq_len))
+
+    q_segment_ids_tile_ref_pre = jnp.asarray(q_segment_ids_tile_ref_pre)
+    kv_segment_ids_tile_ref_pre = jnp.asarray(kv_segment_ids_tile_ref_pre)
+
+    q_segment_ids_tile_ref = nl.static_cast(q_segment_ids_tile_ref, nl.float32)
+    kv_segment_ids_tile_ref = nl.static_cast(kv_segment_ids_tile_ref, nl.float32)
+
+    q_segment_ids_tile_ref = jnp.asarray(q_segment_ids_tile_ref)
+    kv_segment_ids_tile_ref = jnp.asarray(kv_segment_ids_tile_ref)
+    segment_ids_batch = jnp.asarray(segment_ids_batch)
+
+    return segment_ids_batch, q_segment_ids_tile_ref_pre, kv_segment_ids_tile_ref_pre, q_segment_ids_tile_ref, kv_segment_ids_tile_ref
+
+
 @pytest.mark.parametrize(
     "batch_size,seq_len,num_heads,per_head_dim",
     [
         (1, 2048, 1, 64),
-        # (2, 2048, 2, 64),
-        # (1, 2048, 1, 128),
-        # (2, 2048, 2, 128),
-        # (1, 2048, 8, 128),
-        # (2, 2048, 8, 128),
+        (2, 2048, 2, 64),
+        (1, 2048, 1, 128),
+        (2, 2048, 2, 128),
+        (1, 2048, 8, 128),
+        (2, 2048, 8, 128),
         # (1, 4096, 1, 64),
         # (2, 4096, 2, 64),
     ],
 )
-# @pytest.mark.parametrize("causal", [True, False])
-@pytest.mark.parametrize("causal", [True])
-# @pytest.mark.parametrize("attention_bias_type", [None, "2d"])
-@pytest.mark.parametrize("attention_bias_type", [None])
-# @pytest.mark.parametrize("input_dtype", [jnp.float16, jnp.bfloat16, jnp.float32])
-@pytest.mark.parametrize("input_dtype", [jnp.float32])
+@pytest.mark.parametrize("causal", [True, False])
+# @pytest.mark.parametrize("causal", [True])
+@pytest.mark.parametrize("attention_bias_type", [None, "2d"])
+# @pytest.mark.parametrize("attention_bias_type", [None])
+@pytest.mark.parametrize("input_dtype", [jnp.float16, jnp.bfloat16, jnp.float32])
+# @pytest.mark.parametrize("input_dtype", [jnp.float32])
 @pytest.mark.parametrize("seq_packing", [True])
 def test_fwd_against_ref(
     batch_size: int,
@@ -99,8 +129,6 @@ def test_fwd_against_ref(
 ):
     # On demand import only if test is needed.
     # pylint: disable=import-outside-toplevel
-    from axlearn.common.flash_attention.neuron_attention import flash_attention
-    from axlearn.common.flash_attention.neuron_seq_packing_attention import nki_asm_get_sequence_bounds
 
     softmax_scale = per_head_dim**-0.5
     k1, k2, k3, k4 = jax.random.split(jax.random.PRNGKey(42), 4)
@@ -114,29 +142,7 @@ def test_fwd_against_ref(
         bias = None
 
     if seq_packing:
-        seq_lens, q_segment_ids_tile_ref, kv_segment_ids_tile_ref, segment_ids_batch = get_segment_ids(batch_size, seq_len, 8)
-
-        reshaped_segment_ids = segment_ids_batch[:, None, :]  # Add two singleton dimensions to [batch_size, 1, q_seq_len]
-        reshaped_segment_ids = nl.static_cast(reshaped_segment_ids, nl.float32)
-        partial_nki_asm_get_sequence_bounds = partial(nki_asm_get_sequence_bounds[(batch_size,)], output_tensor_dtype=nl.float32)
-        processed_segment_ids = partial_nki_asm_get_sequence_bounds(reshaped_segment_ids)
-        processed_segment_ids = jnp.asarray(processed_segment_ids)
-
-        q_segment_ids_tile_ref_pre = processed_segment_ids[:, :, :seq_len].reshape((batch_size, seq_len))
-        kv_segment_ids_tile_ref_pre = processed_segment_ids[:, :, -seq_len:].reshape((batch_size, seq_len))
-        # # print(q_segment_ids_tile_ref_pre.shape)
-        # # print(kv_segment_ids_tile_ref_pre.shape)
-
-
-        q_segment_ids_tile_ref_pre = jnp.asarray(q_segment_ids_tile_ref_pre)
-        kv_segment_ids_tile_ref_pre = jnp.asarray(kv_segment_ids_tile_ref_pre)
-
-        q_segment_ids_tile_ref = nl.static_cast(q_segment_ids_tile_ref, nl.float32)
-        kv_segment_ids_tile_ref = nl.static_cast(kv_segment_ids_tile_ref, nl.float32)
-
-        q_segment_ids_tile_ref = jnp.asarray(q_segment_ids_tile_ref)
-        kv_segment_ids_tile_ref = jnp.asarray(kv_segment_ids_tile_ref)
-        segment_ids_batch = jnp.asarray(segment_ids_batch)
+        segment_ids_batch, q_segment_ids_tile_ref_pre, kv_segment_ids_tile_ref_pre, q_segment_ids_tile_ref, kv_segment_ids_tile_ref = preprocessing_wrapper(batch_size, seq_len)
 
         chex.assert_trees_all_close(q_segment_ids_tile_ref_pre, q_segment_ids_tile_ref, atol=0.0007)
         chex.assert_trees_all_close(kv_segment_ids_tile_ref_pre, kv_segment_ids_tile_ref, atol=0.0007)

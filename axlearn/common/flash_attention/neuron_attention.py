@@ -12,7 +12,8 @@ import jax.numpy as jnp
 import jax_neuronx  # pylint: disable=unused-import
 import neuronxcc.nki.language as nl
 from jax import custom_vjp
-from axlearn.common.flash_attention.neuron_seq_packing_attention import flash_attn_bwd, flash_attn_bwd_no_bias, flash_fwd, flash_fwd_no_bias, nki_asm_get_sequence_bounds
+from axlearn.common.flash_attention.neuron_seq_packing_attention import flash_attn_bwd, flash_attn_bwd_no_bias, flash_fwd, flash_fwd_no_bias
+from axlearn.common.flash_attention.neuron_seq_packing_attention import nki_asm_get_sequence_bounds
 from neuronxcc import nki
 from neuronxcc.nki import jit as nki_jit
 from jax_neuronx import nki_call
@@ -120,11 +121,12 @@ def _mha_forward(
 
     if segment_ids is not None:
         # FIXME: Only works for batch size 1
-        reshaped_segment_ids = segment_ids[:, None, :]  # Add two singleton dimensions to [batch_size(must be 1), 1, q_seq_len]
-        # batched_nki_asm_get_sequence_bounds = jax.vmap(nki_asm_get_sequence_bounds, in_axes=(0, None))
-        partial_nki_asm_get_sequence_bounds = partial(nki_asm_get_sequence_bounds, output_tensor_dtype=nl.float32)
-        # processed_segment_ids = nki_asm_get_sequence_bounds(reshaped_segment_ids, nl.float32)
-        processed_segment_ids = partial_nki_asm_get_sequence_bounds[(batch_size,)](reshaped_segment_ids)
+        reshaped_segment_ids = segment_ids[:, None, :]  # Add two singleton dimensions to [batch_size, 1, q_seq_len]
+        reshaped_segment_ids = nl.static_cast(reshaped_segment_ids, nl.float32)
+        partial_nki_asm_get_sequence_bounds = partial(nki_asm_get_sequence_bounds[(batch_size,)], output_tensor_dtype=nl.float32)
+        processed_segment_ids = partial_nki_asm_get_sequence_bounds(reshaped_segment_ids)
+        processed_segment_ids = jnp.asarray(processed_segment_ids)
+
         q_segment_ids_tile_ref = processed_segment_ids[:, :, :q_seq_len].reshape((batch_size, q_seq_len))
         kv_segment_ids_tile_ref = processed_segment_ids[:, :, -q_seq_len:].reshape((batch_size, q_seq_len))
 

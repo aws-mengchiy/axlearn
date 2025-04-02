@@ -15,6 +15,8 @@ if jax.default_backend() != "neuron":
  
 import numpy as np
 import neuronxcc.nki.language as nl
+from axlearn.common.flash_attention.neuron_attention import flash_attention
+from axlearn.common.flash_attention.neuron_seq_packing_attention import nki_asm_get_sequence_bounds
  
 def random_ints_sum_to_length(batch_size, length, n_seq):
     np.random.seed(420)
@@ -95,8 +97,6 @@ def test_fwd_against_ref(
 ):
     # On demand import only if test is needed.
     # pylint: disable=import-outside-toplevel
-    from axlearn.common.flash_attention.neuron_attention import flash_attention
-    from axlearn.common.flash_attention.neuron_seq_packing_attention import nki_asm_get_sequence_bounds
  
     softmax_scale = per_head_dim**-0.5
     k1, k2, k3, k4 = jax.random.split(jax.random.PRNGKey(42), 4)
