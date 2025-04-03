@@ -344,6 +344,8 @@ def flash_attention_implementation(
                 value,
                 bias=other_biases.value(),
                 segment_ids=get_segment_ids(segment_ids),
+                # q_segment_ids_tile_ref=get_q_segment_ids_tile_ref(q_segment_ids_tile_ref),
+                # kv_segment_ids_tile_ref=get_kv_segment_ids_tile_ref(kv_segment_ids_tile_ref),
                 causal=causal.has_value(),
                 softmax_scale=softmax_scale,
                 dropout_rate=dropout_rate,

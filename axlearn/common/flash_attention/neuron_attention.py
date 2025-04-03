@@ -55,7 +55,7 @@ def flash_attention(
     Returns:
         The attention outputs of shape [batch_size, target_length, num_heads, per_head_dim].
     """
-    # out, _ = _mha_forward(query, key, value, bias, prng_key, causal, softmax_scale, dropout_rate)
+    # out, _ = _mha_forward(query, key, value, bias, prng_key, q_segment_ids_tile_ref, kv_segment_ids_tile_ref, causal, softmax_scale, dropout_rate)
     out, _ = _mha_forward(query, key, value, bias, prng_key, segment_ids, causal, softmax_scale, dropout_rate)
     return out
 
@@ -120,18 +120,7 @@ def _mha_forward(
         grid = batch_size, num_heads
 
     if segment_ids is not None:
-        # FIXME: Only works for batch size 1
-        reshaped_segment_ids = segment_ids[:, None, :]  # Add two singleton dimensions to [batch_size, 1, q_seq_len]
-        reshaped_segment_ids = nl.static_cast(reshaped_segment_ids, nl.float32)
-        partial_nki_asm_get_sequence_bounds = partial(nki_asm_get_sequence_bounds[(batch_size,)], output_tensor_dtype=nl.float32)
-        processed_segment_ids = partial_nki_asm_get_sequence_bounds(reshaped_segment_ids)
-        processed_segment_ids = jnp.asarray(processed_segment_ids)
-
-        q_segment_ids_tile_ref = processed_segment_ids[:, :, :q_seq_len].reshape((batch_size, q_seq_len))
-        kv_segment_ids_tile_ref = processed_segment_ids[:, :, -q_seq_len:].reshape((batch_size, q_seq_len))
-
-        q_segment_ids_tile_ref = jnp.asarray(q_segment_ids_tile_ref)
-        kv_segment_ids_tile_ref = jnp.asarray(kv_segment_ids_tile_ref)
+        q_segment_ids_tile_ref, kv_segment_ids_tile_ref = preprocessing_wrapper(batch_size, q_seq_len, segment_ids)
     else:
         q_segment_ids_tile_ref, kv_segment_ids_tile_ref = None, None
 
@@ -179,20 +168,20 @@ def _mha_forward(
     # return attn_output, (lse, attn_output, q, k, v, bias, prng_key)
     return attn_output, (lse, attn_output, q, k, v, bias, prng_key, q_segment_ids_tile_ref, kv_segment_ids_tile_ref)
 
-def _flash_fwd_wrapper(grid, q, k, v, prng_key, q_segment_ids_tile_ref, kv_segment_ids_tile_ref, causal, softmax_scale, dropout_rate):
-    flash_fwd[grid](
-        q,
-        k,
-        v,
-        prng_key,
-        None,
-        q_segment_ids_tile_ref,
-        kv_segment_ids_tile_ref,
-        use_causal_mask=causal,
-        softmax_scale=softmax_scale,
-        mixed_precision=True,
-        dropout_p=dropout_rate,
-    )
+# def _flash_fwd_wrapper(grid, q, k, v, prng_key, q_segment_ids_tile_ref, kv_segment_ids_tile_ref, causal, softmax_scale, dropout_rate):
+#     flash_fwd[grid](
+#         q,
+#         k,
+#         v,
+#         prng_key,
+#         None,
+#         q_segment_ids_tile_ref,
+#         kv_segment_ids_tile_ref,
+#         use_causal_mask=causal,
+#         softmax_scale=softmax_scale,
+#         mixed_precision=True,
+#         dropout_p=dropout_rate,
+#     )
 
 
 def _mha_backward(
@@ -265,8 +254,24 @@ def _mha_backward(
     d_key = d_key.transpose(0, 3, 1, 2)  # [batch_size, kv_seq_len, num_heads, d_model]
     d_value = d_value.transpose(0, 3, 1, 2)  # [batch_size, kv_seq_len, num_heads, d_model]
 
-    # return d_query, d_key, d_value, None, None
+    # return d_query, d_key, d_value, None, None, None, None
     return d_query, d_key, d_value, None, None, None
 
 
 flash_attention.defvjp(_mha_forward, _mha_backward)
+
+@partial(jax.jit, static_argnums=[0, 1])
+def preprocessing_wrapper(batch_size, q_seq_len, segment_ids):
+    reshaped_segment_ids = segment_ids[:, None, :]  # Add singleton dimensions to [batch_size, 1, q_seq_len]
+    reshaped_segment_ids = nl.static_cast(reshaped_segment_ids, nl.float32)
+    partial_nki_asm_get_sequence_bounds = partial(nki_asm_get_sequence_bounds[(batch_size,)], output_tensor_dtype=nl.float32)
+    processed_segment_ids = partial_nki_asm_get_sequence_bounds(reshaped_segment_ids)
+    processed_segment_ids = jnp.asarray(processed_segment_ids)
+
+    q_segment_ids_tile_ref = processed_segment_ids[:, :, :q_seq_len].reshape((batch_size, q_seq_len))
+    kv_segment_ids_tile_ref = processed_segment_ids[:, :, -q_seq_len:].reshape((batch_size, q_seq_len))
+
+    q_segment_ids_tile_ref = jnp.asarray(q_segment_ids_tile_ref)
+    kv_segment_ids_tile_ref = jnp.asarray(kv_segment_ids_tile_ref)
+
+    return q_segment_ids_tile_ref, kv_segment_ids_tile_ref
