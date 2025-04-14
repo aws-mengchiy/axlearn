@@ -194,7 +194,7 @@ def _flash_attention_core(q_local_tile, k, v,
                 bound0=q_segment_ids_tile_local,
                 bound1=kv_segment_ids_tile_local,
                 range_start=k_i*B_F_SIZE + local_k_large_tile_idx * LARGE_TILE_SZ,
-                on_false_value=-np.inf, dtype=acc_type)
+                on_false_value=nl.fp32.min, dtype=acc_type)
           else:
             qk_res_buf[:, k_i_b_f_slice] = nisa.affine_select(
                 pred=pred,
@@ -212,7 +212,7 @@ def _flash_attention_core(q_local_tile, k, v,
                   bound0=q_segment_ids_tile_local,
                   range_start=k_i*B_F_SIZE + local_k_large_tile_idx * LARGE_TILE_SZ,
                   bound1=causal_bound,
-                  on_false_value=-np.inf, dtype=acc_type,
+                  on_false_value=nl.fp32.min, dtype=acc_type,
                   mask=diagonal)
         else:
           qk_res_buf[:, k_i_b_f_slice] = nisa.affine_select(
@@ -232,7 +232,7 @@ def _flash_attention_core(q_local_tile, k, v,
                   bound0=q_segment_ids_tile_local,
                   range_start=k_i*B_F_SIZE + local_k_large_tile_idx * LARGE_TILE_SZ,
                   bound1=causal_bound,
-                  on_false_value=-np.inf, dtype=acc_type,
+                  on_false_value=nl.fp32.min, dtype=acc_type,
                   mask=left_diagonal_selection)
       else:
         # For tiles on and to the right of the diagonal, need to do affine_select.
@@ -248,7 +248,7 @@ def _flash_attention_core(q_local_tile, k, v,
                   bound0=q_segment_ids_tile_local,
                   bound1=causal_bound,
                   range_start=k_i*B_F_SIZE + local_k_large_tile_idx * LARGE_TILE_SZ,
-                  on_false_value=-np.inf, dtype=acc_type)
+                  on_false_value=nl.fp32.min, dtype=acc_type)
           else:
             qk_res_buf[:, k_i_b_f_slice] = nisa.affine_select(
               pred=pred,
@@ -263,7 +263,7 @@ def _flash_attention_core(q_local_tile, k, v,
                   bound0=q_segment_ids_tile_local,
                   bound1=causal_bound,
                   range_start=k_i*B_F_SIZE + local_k_large_tile_idx * LARGE_TILE_SZ,
-                  on_false_value=-np.inf, dtype=acc_type, mask=left_diagonal_selection)
+                  on_false_value=nl.fp32.min, dtype=acc_type, mask=left_diagonal_selection)
         else:
           qk_res_buf[:, k_i_b_f_slice] = \
             nl.copy(qk_psum, dtype=acc_type, mask=left_diagonal_selection)
@@ -279,7 +279,7 @@ def _flash_attention_core(q_local_tile, k, v,
                 comp_op1=np.less,
                 bound0=q_segment_ids_tile_local,
                 bound1=kv_segment_ids_tile_local, range_start = k_i*B_F_SIZE + local_k_large_tile_idx * LARGE_TILE_SZ,
-                on_false_value=-np.inf, dtype=acc_type)
+                on_false_value=nl.fp32.min, dtype=acc_type)
       else:
         # Simply send psum result back to sbuf
         if is_seq_packed:
@@ -290,7 +290,7 @@ def _flash_attention_core(q_local_tile, k, v,
                 bound0=q_segment_ids_tile_local[:,:],
                 bound1=kv_segment_ids_tile_local[:,:],
                 range_start=k_i*B_F_SIZE + local_k_large_tile_idx * LARGE_TILE_SZ,
-                on_false_value=-np.inf, dtype=acc_type)
+                on_false_value=nl.fp32.min, dtype=acc_type)
         else:
           qk_res_buf[:, k_i_b_f_slice] = nl.copy(qk_psum, dtype=acc_type)
 
@@ -1486,7 +1486,7 @@ def _flash_attn_bwd_core(
           bound0=q_segment_ids_tile_local,
           range_start=local_i_k_seq_tile * k_seq_tile_size,
           bound1=causal_bound,
-          on_false_value=-np.inf, dtype=mixed_dtype,
+          on_false_value=nl.fp32.min, dtype=mixed_dtype,
           mask=mask)
 
       else:
@@ -1506,7 +1506,7 @@ def _flash_attn_bwd_core(
           bound0=q_segment_ids_tile_local,
           range_start=local_i_k_seq_tile * k_seq_tile_size,
           bound1=causal_bound,
-          on_false_value=-np.inf, dtype=mixed_dtype,
+          on_false_value=nl.fp32.min, dtype=mixed_dtype,
           mask=mask)
       else:
         qk_res_buf[:, :] = nisa.affine_select(
@@ -1527,7 +1527,7 @@ def _flash_attn_bwd_core(
           bound0=q_segment_ids_tile_local,
           range_start=local_i_k_seq_tile * k_seq_tile_size,
           bound1=kv_segment_ids_tile_local,
-          on_false_value=-np.inf, dtype=mixed_dtype)
+          on_false_value=nl.fp32.min, dtype=mixed_dtype)
     else:
       # Simply send psum result back to sbuf
       if is_seq_packed:
@@ -1538,7 +1538,7 @@ def _flash_attn_bwd_core(
           bound0=q_segment_ids_tile_local,
           range_start=local_i_k_seq_tile * k_seq_tile_size,
           bound1=kv_segment_ids_tile_local,
-          on_false_value=-np.inf, dtype=mixed_dtype)
+          on_false_value=nl.fp32.min, dtype=mixed_dtype)
       else:
         qk_res_buf[:, :] = \
           nl.copy(qk_psum[:, :], dtype=mixed_dtype)

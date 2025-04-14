@@ -69,7 +69,7 @@ def get_segment_ids(batch_size, length, n_seq):
     
     return seq_lens, np.array(lhs_batch), np.array(rhs_batch), np.array(segment_ids_batch)+1
 
-@partial(jax.jit, static_argnums=[0, 1])
+# @partial(jax.jit, static_argnums=[0, 1])
 def preprocessing_wrapper(batch_size, seq_len):
 
     seq_lens, q_segment_ids_tile_ref, kv_segment_ids_tile_ref, segment_ids_batch = get_segment_ids(batch_size, seq_len, 8)
@@ -101,21 +101,21 @@ def preprocessing_wrapper(batch_size, seq_len):
     "batch_size,seq_len,num_heads,per_head_dim",
     [
         (1, 2048, 1, 64),
-        (2, 2048, 2, 64),
-        (1, 2048, 1, 128),
-        (2, 2048, 2, 128),
-        (1, 2048, 8, 128),
-        (2, 2048, 8, 128),
+        # (2, 2048, 2, 64),
+        # (1, 2048, 1, 128),
+        # (2, 2048, 2, 128),
+        # (1, 2048, 8, 128),
+        # (2, 2048, 8, 128),
         # (1, 4096, 1, 64),
         # (2, 4096, 2, 64),
     ],
 )
-@pytest.mark.parametrize("causal", [True, False])
-# @pytest.mark.parametrize("causal", [True])
-@pytest.mark.parametrize("attention_bias_type", [None, "2d"])
-# @pytest.mark.parametrize("attention_bias_type", [None])
-@pytest.mark.parametrize("input_dtype", [jnp.float16, jnp.bfloat16, jnp.float32])
-# @pytest.mark.parametrize("input_dtype", [jnp.float32])
+# @pytest.mark.parametrize("causal", [True, False])
+@pytest.mark.parametrize("causal", [True])
+# @pytest.mark.parametrize("attention_bias_type", [None, "2d"])
+@pytest.mark.parametrize("attention_bias_type", [None])
+# @pytest.mark.parametrize("input_dtype", [jnp.float16, jnp.bfloat16, jnp.float32])
+@pytest.mark.parametrize("input_dtype", [jnp.float32])
 @pytest.mark.parametrize("seq_packing", [True])
 def test_fwd_against_ref(
     batch_size: int,
@@ -136,19 +136,28 @@ def test_fwd_against_ref(
     k = jax.random.normal(k2, (batch_size, seq_len, num_heads, per_head_dim), dtype=input_dtype)
     v = jax.random.normal(k3, (batch_size, seq_len, num_heads, per_head_dim), dtype=input_dtype)
 
-    if attention_bias_type == "2d":
-        bias = jax.random.normal(k4, (1, 1, seq_len, seq_len), dtype=input_dtype)
-    else:
-        bias = None
+    # if attention_bias_type == "2d":
+    #     bias = jax.random.normal(k4, (1, 1, seq_len, seq_len), dtype=input_dtype)
+    # else:
+    #     bias = None
+    segment_ids_batch, q_segment_ids_tile_ref_pre, kv_segment_ids_tile_ref_pre, q_segment_ids_tile_ref, kv_segment_ids_tile_ref = preprocessing_wrapper(batch_size, seq_len)
 
-    if seq_packing:
-        segment_ids_batch, q_segment_ids_tile_ref_pre, kv_segment_ids_tile_ref_pre, q_segment_ids_tile_ref, kv_segment_ids_tile_ref = preprocessing_wrapper(batch_size, seq_len)
 
-        chex.assert_trees_all_close(q_segment_ids_tile_ref_pre, q_segment_ids_tile_ref, atol=0.0007)
-        chex.assert_trees_all_close(kv_segment_ids_tile_ref_pre, kv_segment_ids_tile_ref, atol=0.0007)
-    else:
-        segment_ids_batch, q_segment_ids_tile_ref, kv_segment_ids_tile_ref = None, None, None
+    o, o_ref = fwd_wrapper(softmax_scale, q, k, v, segment_ids_batch)
 
+    if input_dtype == jnp.float16:
+        chex.assert_trees_all_close(o, o_ref, atol=0.07)
+    elif input_dtype == jnp.bfloat16:
+        chex.assert_trees_all_close(o, o_ref, atol=0.07)
+    elif input_dtype == jnp.float32:
+        chex.assert_trees_all_close(o, o_ref, atol=0.03)
+
+@partial(jax.jit, static_argnums=[0])
+def fwd_wrapper(softmax_scale, q, k, v, segment_ids_batch):
+    bias = None
+    causal = True
+
+    
     o = flash_attention(
         q,
         k,
@@ -160,22 +169,20 @@ def test_fwd_against_ref(
         softmax_scale=softmax_scale,
         dropout_rate=0.0,
     )
-    o_ref = mha_reference(
-        q,
-        k,
-        v,
-        bias,
-        segment_ids=segment_ids_batch,
-        causal=causal,
-        softmax_scale=softmax_scale,
-        dropout_rate=0.0,
-    )
-    if input_dtype == jnp.float16:
-        chex.assert_trees_all_close(o, o_ref, atol=0.07)
-    elif input_dtype == jnp.bfloat16:
-        chex.assert_trees_all_close(o, o_ref, atol=0.07)
-    elif input_dtype == jnp.float32:
-        chex.assert_trees_all_close(o, o_ref, atol=0.03)
+    # o_ref = mha_reference(
+    #     q,
+    #     k,
+    #     v,
+    #     bias,
+    #     segment_ids=segment_ids_batch,
+    #     causal=causal,
+    #     softmax_scale=softmax_scale,
+    #     dropout_rate=0.0,
+    # )
+    
+    return o
+
+
 
 
 

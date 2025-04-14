@@ -110,29 +110,7 @@ def test_fwd_against_ref(
         bias = None
  
     if seq_packing:
-        seq_lens, q_segment_ids_tile_ref, kv_segment_ids_tile_ref, segment_ids_batch = get_segment_ids(batch_size, seq_len, 8)
- 
-        reshaped_segment_ids = segment_ids_batch[:, None, :]  # Add two singleton dimensions to [batch_size, 1, q_seq_len]
-        reshaped_segment_ids = nl.static_cast(reshaped_segment_ids, nl.float32)
-        partial_nki_asm_get_sequence_bounds = partial(nki_asm_get_sequence_bounds[(batch_size,)], output_tensor_dtype=nl.float32)
-        processed_segment_ids = partial_nki_asm_get_sequence_bounds(reshaped_segment_ids)
-        processed_segment_ids = jnp.asarray(processed_segment_ids)
- 
-        q_segment_ids_tile_ref_pre = processed_segment_ids[:, :, :seq_len].reshape((batch_size, seq_len))
-        kv_segment_ids_tile_ref_pre = processed_segment_ids[:, :, -seq_len:].reshape((batch_size, seq_len))
-        # # print(q_segment_ids_tile_ref_pre.shape)
-        # # print(kv_segment_ids_tile_ref_pre.shape)
- 
- 
-        q_segment_ids_tile_ref_pre = jnp.asarray(q_segment_ids_tile_ref_pre)
-        kv_segment_ids_tile_ref_pre = jnp.asarray(kv_segment_ids_tile_ref_pre)
- 
-        q_segment_ids_tile_ref = nl.static_cast(q_segment_ids_tile_ref, nl.float32)
-        kv_segment_ids_tile_ref = nl.static_cast(kv_segment_ids_tile_ref, nl.float32)
- 
-        q_segment_ids_tile_ref = jnp.asarray(q_segment_ids_tile_ref)
-        kv_segment_ids_tile_ref = jnp.asarray(kv_segment_ids_tile_ref)
-        segment_ids_batch = jnp.asarray(segment_ids_batch)
+        segment_ids_batch, q_segment_ids_tile_ref_pre, kv_segment_ids_tile_ref_pre, q_segment_ids_tile_ref, kv_segment_ids_tile_ref = preprocessing_wrapper(batch_size, seq_len)
  
         chex.assert_trees_all_close(q_segment_ids_tile_ref_pre, q_segment_ids_tile_ref, atol=0.0007)
         chex.assert_trees_all_close(kv_segment_ids_tile_ref_pre, kv_segment_ids_tile_ref, atol=0.0007)
@@ -150,3 +128,30 @@ def test_fwd_against_ref(
         softmax_scale=softmax_scale,
         dropout_rate=0.0,
     )
+
+@partial(jax.jit, static_argnums=[0, 1])
+def preprocessing_wrapper(batch_size, seq_len):
+
+    seq_lens, q_segment_ids_tile_ref, kv_segment_ids_tile_ref, segment_ids_batch = get_segment_ids(batch_size, seq_len, 8)
+    segment_ids_batch = jnp.asarray(segment_ids_batch)
+
+    reshaped_segment_ids = segment_ids_batch[:, None, :]  # Add two singleton dimensions to [batch_size, 1, q_seq_len]
+    reshaped_segment_ids = nl.static_cast(reshaped_segment_ids, nl.float32)
+    partial_nki_asm_get_sequence_bounds = partial(nki_asm_get_sequence_bounds[(batch_size,)], output_tensor_dtype=nl.float32)
+    processed_segment_ids = partial_nki_asm_get_sequence_bounds(reshaped_segment_ids)
+    processed_segment_ids = jnp.asarray(processed_segment_ids)
+
+    q_segment_ids_tile_ref_pre = processed_segment_ids[:, :, :seq_len].reshape((batch_size, seq_len))
+    kv_segment_ids_tile_ref_pre = processed_segment_ids[:, :, -seq_len:].reshape((batch_size, seq_len))
+
+    q_segment_ids_tile_ref_pre = jnp.asarray(q_segment_ids_tile_ref_pre)
+    kv_segment_ids_tile_ref_pre = jnp.asarray(kv_segment_ids_tile_ref_pre)
+
+    q_segment_ids_tile_ref = nl.static_cast(q_segment_ids_tile_ref, nl.float32)
+    kv_segment_ids_tile_ref = nl.static_cast(kv_segment_ids_tile_ref, nl.float32)
+
+    q_segment_ids_tile_ref = jnp.asarray(q_segment_ids_tile_ref)
+    kv_segment_ids_tile_ref = jnp.asarray(kv_segment_ids_tile_ref)
+    segment_ids_batch = jnp.asarray(segment_ids_batch)
+
+    return segment_ids_batch, q_segment_ids_tile_ref_pre, kv_segment_ids_tile_ref_pre, q_segment_ids_tile_ref, kv_segment_ids_tile_ref

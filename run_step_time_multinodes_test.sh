@@ -6,8 +6,10 @@ source /fsx/mengchiy/eric_fork/venv/bin/activate
 
 # sudo dpkg -r aws-neuronx-runtime-lib-debug
 # sudo dpkg -i /fsx/mengchiy/aws-neuronx-dkms_2.x.4290.0_amd64.deb
-sudo dpkg -i /fsx/mengchiy/aws-neuronx-collectives-2.x.25541.0-6b8a083a4.deb
-sudo dpkg -i /fsx/mengchiy/aws-neuronx-runtime-lib-2.x.23913.0-b413f6965.deb
+# sudo dpkg -i /fsx/mengchiy/aws-neuronx-collectives-2.x.25541.0-6b8a083a4.deb
+# sudo dpkg -i /fsx/mengchiy/aws-neuronx-runtime-lib-2.x.23913.0-b413f6965.deb
+sudo dpkg -i /fsx/hongsuh/ncc-6310-040725/axlearn/aws-neuronx-collectives-2.x.27114.0-48fdacfde.deb
+sudo dpkg -i /fsx/hongsuh/ncc-6310-040725/axlearn/aws-neuronx-runtime-lib-2.x.25394.0-2ae37c193.deb
 
 # sudo apt-get install aws-neuronx-tools=2.* -y
 
@@ -38,7 +40,6 @@ pip list
 ARTIFACTS_PATH="/fsx/mengchiy/eric_fork/artifacts"
 # TIMESTAMP=$(date +"%y%m%d%H%M%S")
 TEST_ARTIFACTS_PATH="${ARTIFACTS_PATH}/$SLURM_JOB_ID"
-# TEST_ARTIFACTS_PATH="${ARTIFACTS_PATH}/9111"
 mkdir -p "$TEST_ARTIFACTS_PATH"
 
 NEURON_DUMP_PATH=${TEST_ARTIFACTS_PATH}/neuron_dump

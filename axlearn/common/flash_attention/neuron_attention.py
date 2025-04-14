@@ -260,7 +260,7 @@ def _mha_backward(
 
 flash_attention.defvjp(_mha_forward, _mha_backward)
 
-@partial(jax.jit, static_argnums=[0, 1])
+# @partial(jax.jit, static_argnums=[0, 1])
 def preprocessing_wrapper(batch_size, q_seq_len, segment_ids):
     reshaped_segment_ids = segment_ids[:, None, :]  # Add singleton dimensions to [batch_size, 1, q_seq_len]
     reshaped_segment_ids = nl.static_cast(reshaped_segment_ids, nl.float32)

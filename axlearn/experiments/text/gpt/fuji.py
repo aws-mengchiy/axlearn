@@ -297,7 +297,7 @@ def get_trainer_kwargs(
     elif model_size == "1B":
         trainer_kwargs = dict(
             model_kwargs=dict(
-                num_layers=2,
+                num_layers=16,
                 hidden_dim=2048,
                 num_heads=32,
                 num_kv_heads=num_kv_heads,
@@ -306,9 +306,9 @@ def get_trainer_kwargs(
                 shared_lm_head=True,
                 flash_attention=flash_attention,
             ),
-            learner_kwargs=dict(peak_lr=3e-4, weight_decay=0.1),
+            learner_kwargs=dict(peak_lr=3e-4, weight_decay=6e-6),
             max_sequence_length=max_sequence_length,
-            train_batch_size=train_batch_size,
+            train_batch_size=16,
             max_step=max_step,
             mesh_shape=mesh_shape_from_axes(data=-1, fsdp=8),
             mesh_rules=(
@@ -340,7 +340,7 @@ def get_trainer_kwargs(
                 shared_lm_head=True,
                 flash_attention=flash_attention,
             ),
-            learner_kwargs=dict(peak_lr=3e-4, weight_decay=0.1),
+            learner_kwargs=dict(peak_lr=3e-4, weight_decay=6e-6),
             max_sequence_length=max_sequence_length,
             train_batch_size=16,
             # train_batch_size=64,
@@ -591,8 +591,8 @@ def get_trainer_kwargs(
     elif model_size == "70B":
         trainer_kwargs = dict(
             model_kwargs=dict(
-                num_layers=1,
-                hidden_dim=128,
+                num_layers=80,
+                hidden_dim=128 * 64,
                 num_heads=64,
                 # No GQA support in V1 models, so num_kv_heads is the same as num_heads.
                 num_kv_heads=None if version == Version.V1 else 8,
@@ -602,10 +602,12 @@ def get_trainer_kwargs(
                 shared_lm_head=False,
                 flash_attention=flash_attention,
             ),
-            learner_kwargs=dict(peak_lr=1.5e-5, weight_decay=6e-6),
+            learner_kwargs=dict(peak_lr=1.5e-4, weight_decay=6e-6),
             max_sequence_length=max_sequence_length,
             train_batch_size=int(len(jax.devices())/4),
             max_step=max_step,
+            save_every_n_steps=500000,
+            eval_every_n_steps=500000,
             mesh_shape=mesh_shape_from_axes(fsdp=-1),
             mesh_rules=(
                 # TPU V5e maximum per device batch is 1.
@@ -839,8 +841,7 @@ def trainer_configs(
             train_input_source=train_input_source(
                 vocab_size=vocab_size,
                 max_sequence_length=max_sequence_length,
-                packing_method=input_lm.PackingMethodType.NEURON_SEQ_PACK,
-                # packing_method=input_lm.PackingMethodType.EOS_DELIM_MASK,
+                packing_method=input_lm.PackingMethodType.EOS_DELIM_MASK,
                 # packing_method=None,
             ),
             evalers=evaler_config_dict(

@@ -571,8 +571,6 @@ class Model(BaseModel):
                 "prefix",
                 "input_segment_ids",
                 "input_positions",
-                "q_segment_ids_tile_ref",
-                "kv_segment_ids_tile_ref",
             ]:
                 assert v.ndim == 2
                 input_batch[k] = with_sharding_constraint(
