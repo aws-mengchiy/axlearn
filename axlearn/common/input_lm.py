@@ -3,6 +3,7 @@
 # pylint: disable=too-many-lines
 """Input processing for language modeling."""
 
+import os
 import enum
 import functools
 from collections.abc import Sequence
@@ -20,6 +21,9 @@ from axlearn.common.input_tf_data import rekey
 
 # Value of "target_labels" which will be ignored in seq2seq processing.
 SEQ2SEQ_IGNORE_TARGET_LABEL = -1
+seed = int(os.getenv("DATA_SEED", 42))
+seed = int(seed) if seed is not None else None
+tf.random.set_seed(seed)
 
 
 class InputDataType(Enum):
